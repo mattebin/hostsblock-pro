@@ -1,0 +1,68 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build EXE with PyInstaller
+        run: |
+          pyinstaller --noconfirm --onefile --windowed `
+            --name "HostsBlockPro" `
+            --manifest hostsblock-pro.manifest `
+            --uac-admin `
+            --collect-all mitmproxy `
+            --add-data "filters;filters" `
+            --add-data "apps.json;." `
+            main.py
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HostsBlockPro
+          path: dist/HostsBlockPro.exe
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/HostsBlockPro.exe
+          generate_release_notes: true
+          body: |
+            ## HostsBlock Pro
+
+            Windows tray app that blocks ads in Spotify (and other desktop apps) via an embedded mitmproxy.
+
+            ### Install
+            1. Download **HostsBlockPro.exe** below.
+            2. Double-click. Accept the UAC prompt (needed to install the mitmproxy CA).
+            3. Left-click the tray icon to toggle blocking ON/OFF.
+
+            ### First run
+            - On first toggle ON, the app generates a mitmproxy CA and installs it into your Windows Trusted Root store.
+            - Your hosts file is **not** modified — this uses a local HTTPS proxy on 127.0.0.1:8080, not the hosts file.
+
+            ### Learn mode
+            When a Spotify ad plays, pause it and click **🎵 Ad is playing — capture now** — new rules are appended to `filters/spotify-learned.txt` next to the exe.
+
+            See the [README](https://github.com/mattebin/hostsblock-pro#readme) for full docs, security notes, and limitations.

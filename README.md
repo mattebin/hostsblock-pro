@@ -28,14 +28,17 @@ Toggling OFF reverses all three.
 
 ## Install
 
-Requires **Python 3.10+** and **Administrator** privileges (for the certificate install).
+### Easy way — download the prebuilt exe
+1. Grab **HostsBlockPro.exe** from the [Releases page](https://github.com/mattebin/hostsblock-pro/releases).
+2. Double-click it. Accept the UAC prompt.
+3. Shield icon appears in your tray.
 
+### From source (Python 3.10+)
 ```bat
 pip install -r requirements.txt
 python main.py
 ```
-
-The app will auto-elevate via a UAC prompt if launched without admin rights.
+The app auto-elevates via UAC if launched without admin rights.
 
 ## Tray controls
 
