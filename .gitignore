@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+dist/
+*.spec
+config.json
+proxy_snapshot.json
+blocked.log
+.vscode/
+.idea/

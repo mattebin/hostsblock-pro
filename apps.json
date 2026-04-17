@@ -1,0 +1,9 @@
+{
+  "apps": {
+    "spotify": {
+      "filter_file": "filters/spotify.txt",
+      "enabled": true,
+      "description": "Blocks known Spotify ad & telemetry endpoints."
+    }
+  }
+}
