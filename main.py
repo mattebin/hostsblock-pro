@@ -149,28 +149,36 @@ class ProxyRunner:
         self._started.wait(timeout=10)
         return self._start_error is None and self.master is not None
 
+    async def _amain(self) -> None:
+        # mitmproxy 10+ requires a running event loop at the moment DumpMaster
+        # is instantiated, so we do everything inside this coroutine.
+        self.loop = asyncio.get_running_loop()
+        opts = Options(
+            listen_host=PROXY_HOST,
+            listen_port=PROXY_PORT,
+            ssl_insecure=True,
+        )
+        self.master = DumpMaster(opts, with_termlog=False, with_dumper=False)
+        self.master.addons.add(self.addon)
+        self._started.set()
+        await self.master.run()
+
     def _run(self) -> None:
         try:
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
-            opts = Options(
-                listen_host=PROXY_HOST,
-                listen_port=PROXY_PORT,
-                ssl_insecure=True,
-            )
-            self.master = DumpMaster(opts, with_termlog=False, with_dumper=False)
-            self.master.addons.add(self.addon)
-            self._started.set()
-            self.loop.run_until_complete(self.master.run())
+            asyncio.run(self._amain())
         except BaseException as e:
             self._start_error = e
             self._started.set()
-            log.exception("Proxy crashed: %s", e)
+            try:
+                log.error("Proxy crashed: %r", e)
+            except Exception:
+                pass
 
     def stop(self) -> None:
         if self.master and self.loop:
             try:
-                self.loop.call_soon_threadsafe(self.master.shutdown)
+                # master.shutdown() is a coroutine in mitmproxy 10+
+                asyncio.run_coroutine_threadsafe(self.master.shutdown(), self.loop)
             except Exception as e:
                 log.warning("Shutdown signal failed: %s", e)
         if self.thread:
