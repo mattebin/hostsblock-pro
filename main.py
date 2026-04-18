@@ -164,8 +164,8 @@ def _bypass_to_ignore_regex(host: str) -> str:
     no TLS interception, no decryption — so cert-pinning clients work fine.
 
     Examples:
-      api.anthropic.com  -> r"(^|\.)api\.anthropic\.com:"
-      *.openai.com       -> r"(^|\.)openai\.com:"
+      api.anthropic.com  -> r"(^|\\.)api\\.anthropic\\.com:"
+      *.openai.com       -> r"(^|\\.)openai\\.com:"
     """
     import re as _re
     h = host.strip().lower()
