@@ -54,11 +54,39 @@ def app_root() -> Path:
     return Path(__file__).resolve().parent
 
 
+def bundled_root() -> Path:
+    """
+    Where PyInstaller-bundled data files live at runtime.
+
+    With ``--onefile`` the bundle is extracted to ``sys._MEIPASS``. From source
+    we just use the script directory.
+    """
+    return Path(getattr(sys, "_MEIPASS", str(app_root())))
+
+
+def ensure_bundled_default(name: str) -> None:
+    """Copy a bundled default file into the exe's directory if missing on disk."""
+    target = ROOT / name
+    if target.exists():
+        return
+    src = bundled_root() / name
+    if src.exists() and src != target:
+        try:
+            target.write_bytes(src.read_bytes())
+            log.info("Seeded %s from bundle", name)
+        except Exception as e:
+            log.warning("Could not seed %s: %s", name, e)
+
+
 ROOT = app_root()
 CONFIG_PATH = ROOT / "config.json"
 PROXY_SNAPSHOT_PATH = ROOT / "proxy_snapshot.json"
 FILTERS_DIR = ROOT / "filters"
 BLOCKED_LOG = ROOT / "blocked.log"
+BYPASS_PATH = ROOT / "bypass.txt"
+
+# First-run: copy editable defaults out of the PyInstaller bundle
+ensure_bundled_default("bypass.txt")
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +256,9 @@ class InterceptifyApp:
         # 2. Snapshot current proxy settings, then enable ours
         snap = system_proxy.snapshot_current()
         system_proxy.save_snapshot(PROXY_SNAPSHOT_PATH, snap)
-        system_proxy.enable(f"{PROXY_HOST}:{PROXY_PORT}")
+        bypass = system_proxy.load_bypass_file(BYPASS_PATH)
+        log.info("Loaded %d bypass host(s) from %s", len(bypass), BYPASS_PATH.name)
+        system_proxy.enable(f"{PROXY_HOST}:{PROXY_PORT}", bypass_hosts=bypass)
 
         # 3. Install CA once (mitmproxy generates it the first time it starts)
         if not self.cfg.get("cert_installed"):
@@ -299,6 +329,19 @@ class InterceptifyApp:
         except Exception as e:
             self.notify(f"Could not open filters folder: {e}")
 
+    def open_bypass(self, *_args) -> None:
+        """Open bypass.txt — hosts that should never be intercepted."""
+        try:
+            if not BYPASS_PATH.exists():
+                BYPASS_PATH.write_text(
+                    "# One host per line. Wildcards with * supported.\n",
+                    encoding="utf-8",
+                )
+            os.startfile(str(BYPASS_PATH))  # type: ignore[attr-defined]
+            self.notify("Edit bypass.txt, then toggle OFF/ON to apply.")
+        except Exception as e:
+            self.notify(f"Could not open bypass.txt: {e}")
+
     def capture_ad(self, *_args) -> None:
         """
         Learn-mode: the user just heard/saw an ad. Pause it, click this, and we
@@ -353,6 +396,7 @@ class InterceptifyApp:
             Item("Install certificate", self.install_cert),
             Item("Uninstall certificate", self.uninstall_cert),
             Item("Open filter rules", self.open_filters),
+            Item("Open bypass list", self.open_bypass),
             Item("View blocked requests", self.view_blocked),
             Menu.SEPARATOR,
             Item("Exit", self.quit_app),

@@ -1,0 +1,44 @@
+# Interceptify — proxy bypass list
+#
+# Hosts in this file will NEVER be intercepted. Windows routes their traffic
+# directly, skipping mitmproxy entirely. Use this for any app/service that
+# uses certificate pinning, ships its own CA bundle, or otherwise refuses to
+# trust the mitmproxy CA (you'll see "tlsv1 alert unknown ca" in the proxy
+# log when this happens).
+#
+# Syntax: one host per line. Wildcards with * supported.
+# Lines starting with # are comments.
+
+# --- AI / LLM APIs ---
+api.anthropic.com
+*.anthropic.com
+claude.ai
+api.openai.com
+*.openai.com
+*.oaistatic.com
+api.mistral.ai
+generativelanguage.googleapis.com
+api.cohere.ai
+api.perplexity.ai
+
+# --- Dev tools that ship their own CA bundle ---
+api.github.com
+*.githubusercontent.com
+*.githubcopilot.com
+copilot-proxy.githubusercontent.com
+registry.npmjs.org
+pypi.org
+files.pythonhosted.org
+
+# --- Cloud / OS update endpoints ---
+*.windowsupdate.com
+*.microsoft.com
+*.office.com
+*.azure.com
+*.amazonaws.com
+*.cloudflare.com
+
+# --- Banking / payments (cert pinning is the rule here) ---
+# Add your bank's domains, PayPal, Stripe, etc., as needed.
+*.paypal.com
+*.stripe.com

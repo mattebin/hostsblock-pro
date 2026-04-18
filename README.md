@@ -60,6 +60,7 @@ The app auto-elevates via UAC if launched without admin rights.
 | **Reload filters** | Re-reads all files in `filters/` without restarting          |
 | **Install certificate** | Re-install mitmproxy CA (if you cleared it manually)    |
 | **Open filter rules**   | Opens `filters/` in Explorer so you can edit rules      |
+| **Open bypass list**    | Opens `bypass.txt` — hosts that should never be intercepted |
 | **View blocked requests** | Toast with per-app counts + opens `blocked.log`       |
 | **Exit**        | Stops proxy, restores system proxy, quits                       |
 
@@ -85,6 +86,20 @@ git push
 ```
 
 Review the file before committing — the heuristics are conservative but not perfect. Remove anything that looks like legit music/auth traffic.
+
+## Bypass list (don't intercept these)
+
+Some apps refuse to trust the mitmproxy CA — they ship their own CA bundle (Node/Electron tools, Python `certifi`, Go binaries) or do certificate pinning (banking apps, the Anthropic API, OpenAI API). When a proxy tries to MITM them they throw `tlsv1 alert unknown ca` and refuse to talk.
+
+`bypass.txt` lists hosts that should **never** be intercepted — Windows routes their traffic directly. Pre-filled with common APIs (Anthropic, OpenAI, GitHub, npm, PyPI, banking, etc.). Edit via tray menu → **Open bypass list**, then toggle OFF/ON to apply.
+
+```text
+# bypass.txt
+api.anthropic.com
+*.openai.com
+api.github.com
+*.paypal.com
+```
 
 ## Filter syntax
 

@@ -94,12 +94,39 @@ def load_snapshot(path: Path) -> dict | None:
         return None
 
 
-def enable(server: str = DEFAULT_PROXY, override: str = DEFAULT_OVERRIDE) -> None:
-    """Turn the system proxy ON, pointing at ``server``."""
+def enable(
+    server: str = DEFAULT_PROXY,
+    override: str = DEFAULT_OVERRIDE,
+    bypass_hosts: list[str] | None = None,
+) -> None:
+    """
+    Turn the system proxy ON, pointing at ``server``.
+
+    ``bypass_hosts`` is appended to the default LAN override list so traffic
+    to those hosts skips the proxy entirely. Use it for endpoints with
+    certificate pinning or their own CA bundle (Anthropic, OpenAI, etc.).
+    """
+    full_override = override
+    if bypass_hosts:
+        cleaned = ";".join(h.strip() for h in bypass_hosts if h.strip())
+        if cleaned:
+            full_override = full_override + ";" + cleaned
     _write("ProxyEnable", 1, winreg.REG_DWORD)
     _write("ProxyServer", server)
-    _write("ProxyOverride", override)
+    _write("ProxyOverride", full_override)
     _notify_wininet()
+
+
+def load_bypass_file(path: Path) -> list[str]:
+    """Read a bypass.txt file: one host per line, # comments, blanks ignored."""
+    if not path.exists():
+        return []
+    out: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if s and not s.startswith("#"):
+            out.append(s)
+    return out
 
 
 def disable() -> None:

@@ -34,6 +34,7 @@ jobs:
             --collect-all mitmproxy `
             --add-data "filters;filters" `
             --add-data "apps.json;." `
+            --add-data "bypass.txt;." `
             main.py
 
       - name: Upload build artifact
