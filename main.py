@@ -155,6 +155,25 @@ def make_icon(active: bool) -> Image.Image:
 # Proxy lifecycle — mitmproxy DumpMaster runs on its own asyncio loop thread
 # ---------------------------------------------------------------------------
 
+def _bypass_to_ignore_regex(host: str) -> str:
+    """
+    Convert a bypass.txt entry to a mitmproxy ignore_hosts regex.
+
+    mitmproxy's ignore_hosts patterns are regexes matched (with re.search)
+    against ``host:port``. When matched, the connection is tunneled raw —
+    no TLS interception, no decryption — so cert-pinning clients work fine.
+
+    Examples:
+      api.anthropic.com  -> r"(^|\.)api\.anthropic\.com:"
+      *.openai.com       -> r"(^|\.)openai\.com:"
+    """
+    import re as _re
+    h = host.strip().lower()
+    if h.startswith("*."):
+        h = h[2:]
+    return r"(^|\.)" + _re.escape(h) + r":"
+
+
 class ProxyRunner:
     """Owns the DumpMaster and the thread running its event loop."""
 
@@ -165,10 +184,13 @@ class ProxyRunner:
         self.thread: Optional[threading.Thread] = None
         self._started = threading.Event()
         self._start_error: Optional[BaseException] = None
+        self._ignore_hosts: list[str] = []
 
-    def start(self) -> bool:
+    def start(self, bypass_hosts: Optional[list[str]] = None) -> bool:
         if self.thread and self.thread.is_alive():
             return True
+        self._ignore_hosts = [_bypass_to_ignore_regex(h) for h in (bypass_hosts or [])]
+        log.info("Proxy ignore_hosts patterns: %d", len(self._ignore_hosts))
         self._started.clear()
         self._start_error = None
         self.thread = threading.Thread(target=self._run, name="mitmproxy", daemon=True)
@@ -186,6 +208,11 @@ class ProxyRunner:
             listen_port=PROXY_PORT,
             ssl_insecure=True,
         )
+        # ignore_hosts: when host:port matches any regex, mitmproxy tunnels
+        # the connection raw without TLS interception. Essential for
+        # cert-pinning clients (Anthropic SDK, OpenAI SDK, banking apps).
+        if self._ignore_hosts:
+            opts.update(ignore_hosts=self._ignore_hosts)
         self.master = DumpMaster(opts, with_termlog=False, with_dumper=False)
         self.master.addons.add(self.addon)
         self._started.set()
@@ -248,16 +275,21 @@ class InterceptifyApp:
     # -- actions -----------------------------------------------------------
 
     def turn_on(self) -> None:
-        # 1. Start the proxy
-        if not self.runner.start():
+        # Load bypass list up front — it's used both by the proxy itself
+        # (ignore_hosts → true TCP passthrough for cert-pinning clients)
+        # and by the Windows system proxy (ProxyOverride → WinINET apps
+        # skip the proxy entirely).
+        bypass = system_proxy.load_bypass_file(BYPASS_PATH)
+        log.info("Loaded %d bypass host(s) from %s", len(bypass), BYPASS_PATH.name)
+
+        # 1. Start the proxy with ignore_hosts baked in
+        if not self.runner.start(bypass_hosts=bypass):
             self.notify("Failed to start proxy — check logs.")
             return
 
         # 2. Snapshot current proxy settings, then enable ours
         snap = system_proxy.snapshot_current()
         system_proxy.save_snapshot(PROXY_SNAPSHOT_PATH, snap)
-        bypass = system_proxy.load_bypass_file(BYPASS_PATH)
-        log.info("Loaded %d bypass host(s) from %s", len(bypass), BYPASS_PATH.name)
         system_proxy.enable(f"{PROXY_HOST}:{PROXY_PORT}", bypass_hosts=bypass)
 
         # 3. Install CA once (mitmproxy generates it the first time it starts)
