@@ -247,6 +247,37 @@ class ProxyRunner:
 # Tray application
 # ---------------------------------------------------------------------------
 
+def self_heal_stale_proxy() -> None:
+    """
+    If the previous run crashed (or was killed) with the proxy still active,
+    the Windows registry is left pointing at 127.0.0.1:8080 with no proxy
+    process listening — which breaks internet. Detect that on startup and
+    restore the saved snapshot silently.
+    """
+    snap_file = PROXY_SNAPSHOT_PATH
+    if not snap_file.exists():
+        return
+    current = system_proxy.snapshot_current()
+    pointing_at_us = (
+        current.get("ProxyEnable") == 1
+        and str(current.get("ProxyServer", "")).startswith(f"{PROXY_HOST}:{PROXY_PORT}")
+    )
+    if not pointing_at_us:
+        return
+    log.warning("Stale proxy state from previous session detected — restoring")
+    snap = system_proxy.load_snapshot(snap_file)
+    if snap:
+        try:
+            system_proxy.restore(snap)
+        except Exception as e:
+            log.error("Restore failed, clearing proxy: %s", e)
+            system_proxy.disable()
+    try:
+        snap_file.unlink()
+    except OSError:
+        pass
+
+
 class InterceptifyApp:
     def __init__(self) -> None:
         self.cfg = load_config()
@@ -254,6 +285,29 @@ class InterceptifyApp:
         self.addon = BlockerAddon(ROOT)
         self.runner = ProxyRunner(self.addon)
         self.icon: Optional[pystray.Icon] = None
+        # Crash / kill safety — always run on interpreter exit regardless of
+        # how we got there (clean tray Exit, Ctrl+C, unhandled exception).
+        import atexit
+        atexit.register(self._emergency_restore)
+
+    def _emergency_restore(self) -> None:
+        """Last-ditch cleanup so we never leave the user with broken internet."""
+        if not self.active:
+            return
+        log.warning("Emergency cleanup — restoring system proxy on exit")
+        try:
+            self.turn_off()
+        except Exception as e:
+            log.error("turn_off failed in emergency cleanup: %s", e)
+            # Fallback: brute-force restore from snapshot file
+            try:
+                snap = system_proxy.load_snapshot(PROXY_SNAPSHOT_PATH)
+                if snap:
+                    system_proxy.restore(snap)
+                else:
+                    system_proxy.disable()
+            except Exception as e2:
+                log.error("Fallback restore failed: %s", e2)
 
     # -- helpers -----------------------------------------------------------
 
@@ -452,7 +506,14 @@ def main() -> None:
     if not is_admin():
         relaunch_as_admin()
         return
-    InterceptifyApp().run()
+    # Heal before constructing the app so any stale proxy state is gone first
+    self_heal_stale_proxy()
+    app = InterceptifyApp()
+    try:
+        app.run()
+    finally:
+        # Belt-and-braces on top of the atexit hook
+        app._emergency_restore()
 
 
 if __name__ == "__main__":

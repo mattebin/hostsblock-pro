@@ -1,44 +1,184 @@
 # Interceptify — proxy bypass list
 #
-# Hosts in this file will NEVER be intercepted. Windows routes their traffic
-# directly, skipping mitmproxy entirely. Use this for any app/service that
-# uses certificate pinning, ships its own CA bundle, or otherwise refuses to
-# trust the mitmproxy CA (you'll see "tlsv1 alert unknown ca" in the proxy
-# log when this happens).
+# Hosts in this file will NEVER be intercepted. Three layers apply them:
+#   1. mitmproxy `ignore_hosts`  — raw TCP passthrough (cert pinning survives)
+#   2. Windows ProxyOverride     — WinINET apps skip the proxy at OS level
+#   3. NO_PROXY user env var     — Python / Node / Go / curl all honor this
 #
-# Syntax: one host per line. Wildcards with * supported.
+# Syntax: one host per line. Leading "*." is treated as "any subdomain".
 # Lines starting with # are comments.
-
-# --- AI / LLM APIs ---
+#
+# ---------------------------------------------------------------------------
+# AI / LLM APIs (cert-pinned or ship own CA bundle)
+# ---------------------------------------------------------------------------
 api.anthropic.com
 *.anthropic.com
 claude.ai
 api.openai.com
 *.openai.com
 *.oaistatic.com
+chatgpt.com
+*.chatgpt.com
 api.mistral.ai
 generativelanguage.googleapis.com
 api.cohere.ai
 api.perplexity.ai
+*.perplexity.ai
+api.groq.com
+api.together.xyz
+huggingface.co
+*.huggingface.co
 
-# --- Dev tools that ship their own CA bundle ---
+# ---------------------------------------------------------------------------
+# Developer tools / package registries (own CA bundles)
+# ---------------------------------------------------------------------------
 api.github.com
+*.github.com
 *.githubusercontent.com
 *.githubcopilot.com
 copilot-proxy.githubusercontent.com
 registry.npmjs.org
+*.npmjs.org
 pypi.org
+*.pypi.org
 files.pythonhosted.org
+*.pythonhosted.org
+crates.io
+*.crates.io
+rubygems.org
+*.rubygems.org
+pkg.go.dev
+proxy.golang.org
+*.docker.io
+*.docker.com
+hub.docker.com
+*.jetbrains.com
+*.visualstudio.com
+marketplace.visualstudio.com
+*.gallerycdn.vsassets.io
+*.gitlab.com
+*.bitbucket.org
 
-# --- Cloud / OS update endpoints ---
+# ---------------------------------------------------------------------------
+# Operating system / driver updates
+# ---------------------------------------------------------------------------
 *.windowsupdate.com
 *.microsoft.com
 *.office.com
+*.office365.com
+*.live.com
+*.outlook.com
+*.msedge.net
 *.azure.com
-*.amazonaws.com
-*.cloudflare.com
+*.azureedge.net
+*.nvidia.com
+*.amd.com
+*.intel.com
+*.dell.com
+*.hp.com
+*.lenovo.com
+*.apple.com
+*.icloud.com
+*.mzstatic.com
 
-# --- Banking / payments (cert pinning is the rule here) ---
-# Add your bank's domains, PayPal, Stripe, etc., as needed.
+# ---------------------------------------------------------------------------
+# Communication / meetings
+# ---------------------------------------------------------------------------
+*.zoom.us
+*.zoomgov.com
+*.teams.microsoft.com
+*.slack.com
+*.slack-edge.com
+*.discord.com
+*.discordapp.com
+*.discord.gg
+*.signal.org
+*.whatsapp.com
+*.whatsapp.net
+*.telegram.org
+*.t.me
+*.webex.com
+*.skype.com
+
+# ---------------------------------------------------------------------------
+# Cloud storage / sync
+# ---------------------------------------------------------------------------
+*.dropbox.com
+*.dropboxapi.com
+*.onedrive.com
+*.onedrive.live.com
+*.sharepoint.com
+*.google.com
+*.googleapis.com
+*.gstatic.com
+*.googleusercontent.com
+drive.google.com
+mail.google.com
+docs.google.com
+
+# ---------------------------------------------------------------------------
+# Infrastructure (CDNs, cloud providers — pinned or bundle-owning)
+# ---------------------------------------------------------------------------
+*.amazonaws.com
+*.aws.amazon.com
+*.cloudflare.com
+*.cloudfront.net
+*.fastly.net
+*.akamai.net
+*.akamaized.net
+*.digitaloceanspaces.com
+
+# ---------------------------------------------------------------------------
+# Banking / payments (cert pinning is the rule)
+# ---------------------------------------------------------------------------
 *.paypal.com
 *.stripe.com
+*.klarna.com
+*.swish.nu
+*.bankid.com
+*.plaid.com
+# Add your own bank's domains here.
+
+# ---------------------------------------------------------------------------
+# Gaming / launchers (anti-cheat + pinning)
+# ---------------------------------------------------------------------------
+*.steampowered.com
+*.steamcommunity.com
+*.steamstatic.com
+*.valve.net
+*.epicgames.com
+*.battle.net
+*.blizzard.com
+*.xbox.com
+*.xboxlive.com
+*.ea.com
+*.origin.com
+*.ubisoft.com
+*.ubi.com
+*.riotgames.com
+*.nintendo.net
+
+# ---------------------------------------------------------------------------
+# Creative suites / common SaaS
+# ---------------------------------------------------------------------------
+*.adobe.com
+*.autodesk.com
+*.figma.com
+*.notion.so
+*.notion.site
+*.linear.app
+*.atlassian.com
+*.atlassian.net
+
+# ---------------------------------------------------------------------------
+# Streaming / media (for playback, not ads — ads targeted elsewhere)
+# ---------------------------------------------------------------------------
+*.netflix.com
+*.nflxvideo.net
+*.disneyplus.com
+*.hotstar.com
+*.primevideo.com
+*.hbomax.com
+*.max.com
+# NOTE: We deliberately DO NOT bypass *.spotify.com or *.youtube.com — those
+# are the ones we *want* to filter.
