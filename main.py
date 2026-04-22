@@ -66,17 +66,22 @@ def bundled_root() -> Path:
 
 
 def ensure_bundled_default(name: str) -> None:
-    """Copy a bundled default file into the exe's directory if missing on disk."""
+    """Copy a bundled default file (or directory) into the exe's directory if missing on disk."""
     target = ROOT / name
     if target.exists():
         return
     src = bundled_root() / name
-    if src.exists() and src != target:
-        try:
+    if not src.exists() or src == target:
+        return
+    try:
+        if src.is_dir():
+            import shutil
+            shutil.copytree(src, target)
+        else:
             target.write_bytes(src.read_bytes())
-            log.info("Seeded %s from bundle", name)
-        except Exception as e:
-            log.warning("Could not seed %s: %s", name, e)
+        log.info("Seeded %s from bundle", name)
+    except Exception as e:
+        log.warning("Could not seed %s: %s", name, e)
 
 
 ROOT = app_root()
@@ -88,6 +93,7 @@ BYPASS_PATH = ROOT / "bypass.txt"
 
 # First-run: copy editable defaults out of the PyInstaller bundle
 ensure_bundled_default("bypass.txt")
+ensure_bundled_default("extensions")
 
 
 # ---------------------------------------------------------------------------

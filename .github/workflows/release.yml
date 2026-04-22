@@ -35,6 +35,7 @@ jobs:
             --add-data "filters;filters" `
             --add-data "apps.json;." `
             --add-data "bypass.txt;." `
+            --add-data "extensions;extensions" `
             main.py
 
       - name: Upload build artifact
