@@ -210,6 +210,20 @@
     return false;
   }
 
+  // During ads on Spotify Free 1.2.88+, the skip-forward button is REMOVED
+  // entirely and replaced with podcast-style controls including
+  // 'control-button-seek-forward-15' (jump 15s). That button is NOT disabled
+  // during ads, and clicking it repeatedly drains the ad to its end --
+  // Spotify then auto-advances. Verified live 2026-04-29.
+  function spamSeekForward(times = 5) {
+    const btn = document.querySelector('[data-testid="control-button-seek-forward-15"]');
+    if (!btn) return false;
+    for (let i = 0; i < times; i++) {
+      try { btn.click(); } catch {}
+    }
+    return true;
+  }
+
   // Spotify 1.2.88+ uses Web Audio API rather than an <audio> element, so
   // setting .muted on media elements is a no-op (there ARE no media elements
   // in the DOM). The reliable mute is to click Spotify's own volume-bar
@@ -281,18 +295,21 @@
 
   function check() {
     const detected = isAdPlaying();
-    if (detected && !wasAd) {
-      stats.detections++;
-      stats.lastDetection = new Date().toISOString();
-      stats.lastSelector = detected;
-      log("ad detected via:", detected);
-      setBadgeState("ad");
-      muteAllAudio(true);
+    if (detected) {
+      if (!wasAd) {
+        stats.detections++;
+        stats.lastDetection = new Date().toISOString();
+        stats.lastSelector = detected;
+        log("ad detected via:", detected);
+        setBadgeState("ad");
+        muteAllAudio(true);
+      }
+      // Keep applying skip on every iteration the ad is still present.
+      // The standard skip button doesn't exist during Free ads, so we fall
+      // back to spamming seek-forward-15 which DOES work and which Spotify
+      // doesn't disable.
       if (!clickNextTrack()) {
-        const audio = document.querySelector("audio");
-        if (audio && isFinite(audio.duration)) {
-          try { audio.currentTime = Math.max(0, audio.duration - 0.25); } catch {}
-        }
+        spamSeekForward(3);
       }
     } else if (!detected && wasAd) {
       log("ad ended");
