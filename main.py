@@ -1,27 +1,38 @@
 """
-Interceptify — Windows tray app that runs an embedded mitmproxy to block
-ads inside the Spotify desktop app (and any other app you add a filter for).
+Interceptify - Windows tray app that patches Spotify's xpui.spa to detect
+ad tracks in the desktop client and skip / mute them.
 
-High-level flow:
-    1. On Toggle ON we:
-         * start a mitmproxy DumpMaster in a background thread
-         * snapshot + write the WinINET system-proxy registry values
-         * install mitmproxy's CA into the Trusted Root store (once)
-    2. On Toggle OFF we reverse all three.
+Why xpui-only and not the old mitmproxy pipeline:
+    Spotify 1.2.88+ stopped using the Windows system proxy. All API and
+    audio traffic now goes direct (TCP + QUIC), so mitmproxy can't see it.
+    The client-side patch is the only working layer on modern Spotify.
 
-Keeping each concern in its own module (``proxy_addon``, ``cert_manager``,
-``system_proxy``) makes the tray wiring here readable.
+What the patch does (extensions/adblock.js, inlined into Spotify's index.html):
+    - Watches the DOM for ad-test-ids (leavebehind-*, ads-video-player-npv,
+      embedded-ad, etc.) and Spotify's own 'adplaying'/'adbreakstart' events
+    - When an ad is detected: clicks Spotify's skip-forward, then if skip
+      is denied, clicks Spotify's volume-mute button. State-tracked so we
+      don't override the user's manual mute.
+    - Hides visual ad surfaces (home-ad-card, embedded-ad-carousel, ...)
+      via CSS rules.
+
+The tray app's runtime job is small: own the patch lifecycle, monitor
+Spotify auto-updates and re-apply the patch when it gets wiped, and
+self-update from GitHub releases.
 """
 
 from __future__ import annotations
 
-import asyncio
+import atexit
 import ctypes
 import json
 import logging
 import os
+import subprocess
 import sys
 import threading
+import time
+from ctypes import wintypes
 from pathlib import Path
 from typing import Optional
 
@@ -29,17 +40,21 @@ from PIL import Image, ImageDraw
 import pystray
 from pystray import MenuItem as Item, Menu
 
-from mitmproxy.options import Options
-from mitmproxy.tools.dump import DumpMaster
-
-import cert_manager
+import self_updater
 import spotify_patcher
-import system_proxy
-from proxy_addon import BlockerAddon
+
+# Optional personal modules - present in some local installs only. Public
+# builds never ship these; importing optionally keeps main.py portable.
+try:
+    import update_watcher  # type: ignore
+    HAS_UPDATE_WATCHER = True
+except ImportError:
+    update_watcher = None  # type: ignore
+    HAS_UPDATE_WATCHER = False
+
 
 APP_NAME = "Interceptify"
-PROXY_HOST = "127.0.0.1"
-PROXY_PORT = 8080
+APP_VERSION = "1.5.0"  # bump in lockstep with the GitHub tag
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("interceptify")
@@ -56,17 +71,11 @@ def app_root() -> Path:
 
 
 def bundled_root() -> Path:
-    """
-    Where PyInstaller-bundled data files live at runtime.
-
-    With ``--onefile`` the bundle is extracted to ``sys._MEIPASS``. From source
-    we just use the script directory.
-    """
+    """Where PyInstaller-bundled data lives at runtime (sys._MEIPASS one-file)."""
     return Path(getattr(sys, "_MEIPASS", str(app_root())))
 
 
 def ensure_bundled_default(name: str) -> None:
-    """Copy a bundled default file (or directory) into the exe's directory if missing on disk."""
     target = ROOT / name
     if target.exists():
         return
@@ -86,13 +95,8 @@ def ensure_bundled_default(name: str) -> None:
 
 ROOT = app_root()
 CONFIG_PATH = ROOT / "config.json"
-PROXY_SNAPSHOT_PATH = ROOT / "proxy_snapshot.json"
-FILTERS_DIR = ROOT / "filters"
-BLOCKED_LOG = ROOT / "blocked.log"
-BYPASS_PATH = ROOT / "bypass.txt"
 
 # First-run: copy editable defaults out of the PyInstaller bundle
-ensure_bundled_default("bypass.txt")
 ensure_bundled_default("extensions")
 
 
@@ -114,7 +118,7 @@ def relaunch_as_admin() -> None:
     if rc <= 32:
         ctypes.windll.user32.MessageBoxW(
             None,
-            f"{APP_NAME} requires Administrator privileges to install its certificate.",
+            f"{APP_NAME} requires Administrator privileges to write Spotify's xpui.spa.",
             APP_NAME,
             0x10,
         )
@@ -125,17 +129,30 @@ def relaunch_as_admin() -> None:
 # Config
 # ---------------------------------------------------------------------------
 
+DEFAULT_CONFIG = {
+    "show_badge": True,
+}
+
+
 def load_config() -> dict:
+    cfg = dict(DEFAULT_CONFIG)
     if CONFIG_PATH.exists():
         try:
-            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
         except Exception:
             pass
-    return {"cert_installed": False}
+    try:
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return cfg
 
 
 def save_config(cfg: dict) -> None:
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    try:
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.warning("save_config failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -159,421 +176,414 @@ def make_icon(active: bool) -> Image.Image:
 
 
 # ---------------------------------------------------------------------------
-# Proxy lifecycle — mitmproxy DumpMaster runs on its own asyncio loop thread
-# ---------------------------------------------------------------------------
-
-def _bypass_to_ignore_regex(host: str) -> str:
-    """
-    Convert a bypass.txt entry to a mitmproxy ignore_hosts regex.
-
-    mitmproxy's ignore_hosts patterns are regexes matched (with re.search)
-    against ``host:port``. When matched, the connection is tunneled raw —
-    no TLS interception, no decryption — so cert-pinning clients work fine.
-
-    Examples:
-      api.anthropic.com  -> r"(^|\\.)api\\.anthropic\\.com:"
-      *.openai.com       -> r"(^|\\.)openai\\.com:"
-    """
-    import re as _re
-    h = host.strip().lower()
-    if h.startswith("*."):
-        h = h[2:]
-    return r"(^|\.)" + _re.escape(h) + r":"
-
-
-class ProxyRunner:
-    """Owns the DumpMaster and the thread running its event loop."""
-
-    def __init__(self, addon: BlockerAddon):
-        self.addon = addon
-        self.master: Optional[DumpMaster] = None
-        self.loop: Optional[asyncio.AbstractEventLoop] = None
-        self.thread: Optional[threading.Thread] = None
-        self._started = threading.Event()
-        self._start_error: Optional[BaseException] = None
-        self._ignore_hosts: list[str] = []
-
-    def start(self, bypass_hosts: Optional[list[str]] = None) -> bool:
-        if self.thread and self.thread.is_alive():
-            return True
-        self._ignore_hosts = [_bypass_to_ignore_regex(h) for h in (bypass_hosts or [])]
-        log.info("Proxy ignore_hosts patterns: %d", len(self._ignore_hosts))
-        self._started.clear()
-        self._start_error = None
-        self.thread = threading.Thread(target=self._run, name="mitmproxy", daemon=True)
-        self.thread.start()
-        # Wait up to 10s for startup
-        self._started.wait(timeout=10)
-        return self._start_error is None and self.master is not None
-
-    async def _amain(self) -> None:
-        # mitmproxy 10+ requires a running event loop at the moment DumpMaster
-        # is instantiated, so we do everything inside this coroutine.
-        self.loop = asyncio.get_running_loop()
-        opts = Options(
-            listen_host=PROXY_HOST,
-            listen_port=PROXY_PORT,
-            ssl_insecure=True,
-        )
-        # ignore_hosts: when host:port matches any regex, mitmproxy tunnels
-        # the connection raw without TLS interception. Essential for
-        # cert-pinning clients (Anthropic SDK, OpenAI SDK, banking apps).
-        if self._ignore_hosts:
-            opts.update(ignore_hosts=self._ignore_hosts)
-        self.master = DumpMaster(opts, with_termlog=False, with_dumper=False)
-        self.master.addons.add(self.addon)
-        self._started.set()
-        await self.master.run()
-
-    def _run(self) -> None:
-        try:
-            asyncio.run(self._amain())
-        except BaseException as e:
-            self._start_error = e
-            self._started.set()
-            try:
-                log.error("Proxy crashed: %r", e)
-            except Exception:
-                pass
-
-    def stop(self) -> None:
-        if self.master and self.loop:
-            try:
-                # master.shutdown() is a coroutine in mitmproxy 10+
-                asyncio.run_coroutine_threadsafe(self.master.shutdown(), self.loop)
-            except Exception as e:
-                log.warning("Shutdown signal failed: %s", e)
-        if self.thread:
-            self.thread.join(timeout=5)
-        self.master = None
-        self.loop = None
-        self.thread = None
-
-
-# ---------------------------------------------------------------------------
 # Tray application
 # ---------------------------------------------------------------------------
-
-def self_heal_stale_proxy() -> None:
-    """
-    If the previous run crashed (or was killed) with the proxy still active,
-    the Windows registry is left pointing at 127.0.0.1:8080 with no proxy
-    process listening — which breaks internet. Detect that on startup and
-    restore the saved snapshot silently.
-    """
-    snap_file = PROXY_SNAPSHOT_PATH
-    if not snap_file.exists():
-        return
-    current = system_proxy.snapshot_current()
-    pointing_at_us = (
-        current.get("ProxyEnable") == 1
-        and str(current.get("ProxyServer", "")).startswith(f"{PROXY_HOST}:{PROXY_PORT}")
-    )
-    if not pointing_at_us:
-        return
-    log.warning("Stale proxy state from previous session detected — restoring")
-    snap = system_proxy.load_snapshot(snap_file)
-    if snap:
-        try:
-            system_proxy.restore(snap)
-        except Exception as e:
-            log.error("Restore failed, clearing proxy: %s", e)
-            system_proxy.disable()
-    try:
-        snap_file.unlink()
-    except OSError:
-        pass
-
 
 class InterceptifyApp:
     def __init__(self) -> None:
         self.cfg = load_config()
-        self.active = False
-        self.addon = BlockerAddon(ROOT)
-        self.runner = ProxyRunner(self.addon)
         self.icon: Optional[pystray.Icon] = None
-        # Crash / kill safety — always run on interpreter exit regardless of
-        # how we got there (clean tray Exit, Ctrl+C, unhandled exception).
-        import atexit
-        atexit.register(self._emergency_restore)
+        self._latest_release: Optional[self_updater.Release] = None
 
-    def _emergency_restore(self) -> None:
-        """Last-ditch cleanup so we never leave the user with broken internet."""
-        if not self.active:
-            return
-        log.warning("Emergency cleanup — restoring system proxy on exit")
-        try:
-            self.turn_off()
-        except Exception as e:
-            log.error("turn_off failed in emergency cleanup: %s", e)
-            # Fallback: brute-force restore from snapshot file
+        # Optional personal feature: Spotify-update watcher + ntfy push.
+        # Activates only if the local update_watcher.py is present.
+        self._spotify_watcher = None
+        if HAS_UPDATE_WATCHER:
             try:
-                snap = system_proxy.load_snapshot(PROXY_SNAPSHOT_PATH)
-                if snap:
-                    system_proxy.restore(snap)
-                else:
-                    system_proxy.disable()
-            except Exception as e2:
-                log.error("Fallback restore failed: %s", e2)
+                self._spotify_watcher = update_watcher.UpdateWatcher(
+                    xpui_path=spotify_patcher.spotify_xpui_path(),
+                    is_patched_fn=spotify_patcher.is_patched,
+                    on_update=self._on_spotify_update,
+                    poll_sec=int(self.cfg.get("watcher_poll_sec", 300)),
+                )
+            except Exception as e:
+                log.warning("update_watcher init failed: %s", e)
 
-    # -- helpers -----------------------------------------------------------
+        atexit.register(self._on_exit)
+
+    # ---- Helpers ---------------------------------------------------------
 
     def notify(self, msg: str, title: str = APP_NAME) -> None:
-        # Always log too — Windows toast notifications are unreliable on some
-        # setups (Focus Assist, missing Action Center prefs, etc.).
         log.info("NOTIFY: %s", msg)
         try:
             if self.icon is not None:
                 self.icon.notify(msg, title)
         except Exception as e:
-            log.warning("Notify failed: %s — %s", e, msg)
+            log.warning("Notify failed: %s -- %s", e, msg)
+
+    def _push_multi(self, title: str, message: str, tags=None) -> None:
+        """Toast on Windows + optional ntfy.sh push (only if update_watcher present)."""
+        self.notify(message, title=title)
+        if not HAS_UPDATE_WATCHER:
+            return
+        topic = (self.cfg.get("ntfy_topic") or "").strip()
+        if topic:
+            try:
+                update_watcher.send_ntfy(topic, message, title=title, tags=tags or [])
+            except Exception as e:
+                log.warning("ntfy push failed: %s", e)
+
+    def _is_active(self) -> bool:
+        """Active = Spotify is currently patched."""
+        try:
+            return spotify_patcher.is_patched()
+        except Exception:
+            return False
 
     def refresh_icon(self) -> None:
-        if self.icon is not None:
-            self.icon.icon = make_icon(self.active)
-            self.icon.title = f"{APP_NAME}: {'ON' if self.active else 'OFF'}"
-
-    # -- actions -----------------------------------------------------------
-
-    def turn_on(self) -> None:
-        # Load bypass list up front — it's used both by the proxy itself
-        # (ignore_hosts → true TCP passthrough for cert-pinning clients)
-        # and by the Windows system proxy (ProxyOverride → WinINET apps
-        # skip the proxy entirely).
-        bypass = system_proxy.load_bypass_file(BYPASS_PATH)
-        log.info("Loaded %d bypass host(s) from %s", len(bypass), BYPASS_PATH.name)
-
-        # 1. Start the proxy with ignore_hosts baked in
-        if not self.runner.start(bypass_hosts=bypass):
-            self.notify("Failed to start proxy — check logs.")
+        if self.icon is None:
             return
-
-        # 2. Snapshot current proxy settings, then enable ours
-        snap = system_proxy.snapshot_current()
-        system_proxy.save_snapshot(PROXY_SNAPSHOT_PATH, snap)
-        system_proxy.enable(f"{PROXY_HOST}:{PROXY_PORT}", bypass_hosts=bypass)
-
-        # 3. Install CA once (mitmproxy generates it the first time it starts)
-        if not self.cfg.get("cert_installed"):
-            self.notify("Installing mitmproxy CA into Trusted Root (required for HTTPS interception)...")
-            ok, msg = cert_manager.install_ca()
-            self.notify(msg)
-            if ok:
-                self.cfg["cert_installed"] = True
-                save_config(self.cfg)
-
-        self.active = True
-        self.refresh_icon()
-        self.notify("Blocking ON — proxy listening on 127.0.0.1:8080")
-
-    def turn_off(self) -> None:
-        # Restore proxy settings first so the user regains connectivity even
-        # if proxy shutdown hangs.
-        snap = system_proxy.load_snapshot(PROXY_SNAPSHOT_PATH)
-        if snap is not None:
-            system_proxy.restore(snap)
+        active = self._is_active()
+        self.icon.icon = make_icon(active)
+        if active:
+            state = "blocking Spotify ads"
+        elif spotify_patcher.is_installed():
+            state = "idle - Spotify not patched"
         else:
-            system_proxy.disable()
-
-        self.runner.stop()
-
-        self.active = False
-        self.refresh_icon()
-        self.notify("Blocking OFF — system proxy restored")
-
-    def toggle(self, *_args) -> None:
-        threading.Thread(target=self._toggle_worker, daemon=True).start()
-
-    def _toggle_worker(self) -> None:
-        if self.active:
-            self.turn_off()
-        else:
-            self.turn_on()
-
-    def install_cert(self, *_args) -> None:
-        def worker():
-            cert = cert_manager.find_ca()
-            log.info("Install certificate clicked. CA path: %s", cert)
-            ok, msg = cert_manager.install_ca()
-            log.info("Install certificate result: ok=%s msg=%s", ok, msg)
-            self.notify(msg)
-            if ok:
-                self.cfg["cert_installed"] = True
-                save_config(self.cfg)
-        threading.Thread(target=worker, daemon=True).start()
-
-    def uninstall_cert(self, *_args) -> None:
-        """Remove the mitmproxy CA from the Windows Trusted Root store."""
-        def worker():
-            # Make sure we're not actively intercepting when the cert disappears
-            if self.active:
-                self.turn_off()
-            ok, msg = cert_manager.remove_ca()
-            log.info("Uninstall certificate result: ok=%s msg=%s", ok, msg)
-            self.notify(msg)
-            if ok:
-                self.cfg["cert_installed"] = False
-                save_config(self.cfg)
-        threading.Thread(target=worker, daemon=True).start()
-
-    def open_filters(self, *_args) -> None:
+            state = "Spotify not installed"
+        title = f"{APP_NAME}: {state}"
+        if self._latest_release is not None:
+            title += f"  -  Update {self._latest_release.tag} available"
+        self.icon.title = title[:127]
         try:
-            os.startfile(str(FILTERS_DIR))  # type: ignore[attr-defined]
-        except Exception as e:
-            self.notify(f"Could not open filters folder: {e}")
+            self.icon.menu = self.build_menu()
+        except Exception:
+            pass
 
-    # -- Spotify client-side patch ----------------------------------------
+    # ---- Patch lifecycle ------------------------------------------------
 
     def _current_show_badge(self) -> bool:
         return bool(self.cfg.get("show_badge", True))
 
     def patch_spotify(self, *_args) -> None:
-        """Inject Interceptify's ad-handler JS into Spotify's xpui.spa."""
         def worker():
             if not spotify_patcher.is_installed():
                 self.notify("Spotify not found. Install from spotify.com (desktop, not Store).")
                 return
-            was_running = spotify_patcher.is_spotify_running()
-            if was_running:
+            if spotify_patcher.is_spotify_running():
+                self.notify("Closing Spotify to apply patch...")
                 spotify_patcher.kill_spotify()
-                import time; time.sleep(2)
+                time.sleep(2)
             ok, msg = spotify_patcher.patch(show_badge=self._current_show_badge())
             log.info("patch_spotify: ok=%s msg=%s", ok, msg)
-            # Auto-relaunch if we had to kill it, so the user doesn't have to
-            if ok and was_running:
-                if spotify_patcher.launch_spotify():
-                    self.notify("Spotify patched and relaunched.")
-                    return
             self.notify(msg)
+            if ok:
+                spotify_patcher.launch_spotify()
+            self.refresh_icon()
         threading.Thread(target=worker, daemon=True).start()
 
+    def unpatch_spotify(self, *_args) -> None:
+        def worker():
+            if spotify_patcher.is_spotify_running():
+                self.notify("Closing Spotify to restore original...")
+                spotify_patcher.kill_spotify()
+                time.sleep(2)
+            ok, msg = spotify_patcher.unpatch()
+            log.info("unpatch_spotify: ok=%s msg=%s", ok, msg)
+            self.notify(msg)
+            if ok:
+                spotify_patcher.launch_spotify()
+            self.refresh_icon()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def toggle(self, *_args) -> None:
+        if self._is_active():
+            self.unpatch_spotify()
+        else:
+            self.patch_spotify()
+
     def toggle_show_badge(self, *_args) -> None:
-        """Flip the show-badge preference and re-patch Spotify to apply."""
         def worker():
             new_val = not self._current_show_badge()
             self.cfg["show_badge"] = new_val
             save_config(self.cfg)
-            if not spotify_patcher.is_installed():
-                self.notify(f"Badge preference saved ({'on' if new_val else 'off'}). Spotify not installed.")
+            if not spotify_patcher.is_installed() or not spotify_patcher.is_patched():
+                self.notify(f"Status dot {'shown' if new_val else 'hidden'} (re-patch to apply).")
                 return
             was_running = spotify_patcher.is_spotify_running()
             if was_running:
                 spotify_patcher.kill_spotify()
-                import time; time.sleep(2)
+                time.sleep(2)
             ok, msg = spotify_patcher.patch(show_badge=new_val)
-            log.info("toggle_show_badge -> %s: %s", new_val, msg)
-            if ok and was_running and spotify_patcher.launch_spotify():
-                self.notify(f"Status dot {'shown' if new_val else 'hidden'}. Spotify relaunched.")
-                return
             if ok:
-                self.notify(f"Status dot {'shown' if new_val else 'hidden'}. Restart Spotify to apply.")
+                spotify_patcher.launch_spotify()
+                self.notify(f"Status dot {'shown' if new_val else 'hidden'}. Spotify relaunched.")
             else:
                 self.notify(msg)
         threading.Thread(target=worker, daemon=True).start()
 
-    def unpatch_spotify(self, *_args) -> None:
-        """Restore Spotify's original xpui.spa from backup."""
-        def worker():
+    # ---- Self-update -----------------------------------------------------
+
+    def _poll_for_updates_loop(self) -> None:
+        first = True
+        while True:
+            time.sleep(60 if first else 6 * 3600)
+            first = False
+            try:
+                rel = self_updater.get_latest_release()
+                if rel and self_updater.is_newer(rel.tag, APP_VERSION):
+                    if self._latest_release is None or self._latest_release.tag != rel.tag:
+                        log.info("Update available: %s (current %s)", rel.tag, APP_VERSION)
+                        self._latest_release = rel
+                        self.refresh_icon()
+                        self.notify(
+                            f"Update {rel.tag} available. Click 'Install update' in the tray menu.",
+                        )
+                else:
+                    if self._latest_release is not None:
+                        self._latest_release = None
+                        self.refresh_icon()
+            except Exception as e:
+                log.warning("Update poll failed: %s", e)
+
+    def install_update(self, *_args) -> None:
+        rel = self._latest_release
+        if rel is None:
+            self.notify("No update pending.")
+            return
+        msg = (
+            f"Interceptify {rel.tag} is available.\n\n"
+            f"Current version: {APP_VERSION}\n"
+            f"Download size:   {rel.exe_asset_size // (1024*1024)} MB\n\n"
+            "The app will close, replace itself, and relaunch automatically.\n\n"
+            "Install now?"
+        )
+        try:
+            answer = ctypes.windll.user32.MessageBoxW(
+                None, msg, f"{APP_NAME} update", 0x4 | 0x20 | 0x40000
+            )
+        except Exception as e:
+            log.warning("MessageBox failed: %s", e)
+            answer = 6
+        if answer != 6:
+            return
+        threading.Thread(target=self._perform_update, args=(rel,), daemon=True).start()
+
+    def _perform_update(self, rel: "self_updater.Release") -> None:
+        if not getattr(sys, "frozen", False):
+            try:
+                ctypes.windll.user32.MessageBoxW(
+                    None,
+                    "You're running Interceptify from source.\n"
+                    f"Update with: git pull && pip install -r requirements.txt\n"
+                    f"\nLatest release: {rel.html_url}",
+                    f"{APP_NAME} update",
+                    0x40 | 0x40000,
+                )
+            except Exception:
+                self.notify("Source mode: git pull to update.")
+            return
+        if not rel.exe_asset_url:
+            self.notify(f"Latest release {rel.tag} has no Interceptify.exe asset.")
+            return
+        self.notify(f"Downloading {rel.tag}...")
+        new_exe = ROOT / "Interceptify.exe.new"
+        try:
+            self_updater.download_asset(rel.exe_asset_url, new_exe)
+        except Exception as e:
+            self.notify(f"Download failed: {e}")
+            return
+        target_exe = Path(sys.executable).resolve()
+        bat = ROOT / "_interceptify_update.bat"
+        try:
+            self_updater.write_updater_bat(
+                bat, current_pid=os.getpid(),
+                new_exe=new_exe.resolve(), target_exe=target_exe,
+            )
+        except Exception as e:
+            self.notify(f"Updater script failed: {e}")
+            return
+        self.notify(f"Installing {rel.tag} - the app will restart in a few seconds.")
+        try:
+            subprocess.Popen(
+                ["cmd", "/c", str(bat)],
+                creationflags=0x00000008 | 0x00000200,
+                close_fds=True,
+            )
+        except Exception as e:
+            self.notify(f"Updater launch failed: {e}")
+            return
+        try:
+            self.icon.stop()
+        except Exception:
+            pass
+        os._exit(0)
+
+    # ---- Personal: Spotify-update watcher (optional) -------------------
+
+    def _on_spotify_update(self, event: dict) -> None:
+        """Called by update_watcher when xpui.spa changes on disk (personal feature)."""
+        if not event.get("wiped"):
+            return
+        auto = bool(self.cfg.get("auto_repatch_spotify", False))
+        if auto:
             was_running = spotify_patcher.is_spotify_running()
             if was_running:
                 spotify_patcher.kill_spotify()
-                import time; time.sleep(2)
-            ok, msg = spotify_patcher.unpatch()
-            log.info("unpatch_spotify: ok=%s msg=%s", ok, msg)
-            if ok and was_running and spotify_patcher.launch_spotify():
-                self.notify("Spotify restored and relaunched.")
-                return
-            self.notify(msg)
-        threading.Thread(target=worker, daemon=True).start()
+                time.sleep(2)
+            ok, _msg = spotify_patcher.patch(show_badge=self._current_show_badge())
+            if ok and was_running:
+                spotify_patcher.launch_spotify()
+            self._push_multi(
+                "Spotify updated - patch re-applied",
+                f"Spotify auto-updated and wiped Interceptify's patch. "
+                f"Auto-repatch {'succeeded' if ok else 'FAILED'}.",
+                tags=["white_check_mark" if ok else "rotating_light"],
+            )
+        else:
+            self._push_multi(
+                "Spotify updated - ad-block wiped",
+                "Spotify auto-updated and removed Interceptify's patch. "
+                "Right-click the tray icon -> Patch Spotify to re-apply.",
+                tags=["warning"],
+            )
+        self.refresh_icon()
 
-    def open_bypass(self, *_args) -> None:
-        """Open bypass.txt — hosts that should never be intercepted."""
-        try:
-            if not BYPASS_PATH.exists():
-                BYPASS_PATH.write_text(
-                    "# One host per line. Wildcards with * supported.\n",
-                    encoding="utf-8",
-                )
-            os.startfile(str(BYPASS_PATH))  # type: ignore[attr-defined]
-            self.notify("Edit bypass.txt, then toggle OFF/ON to apply.")
-        except Exception as e:
-            self.notify(f"Could not open bypass.txt: {e}")
+    def toggle_auto_repatch(self, *_args) -> None:
+        new_val = not bool(self.cfg.get("auto_repatch_spotify", False))
+        self.cfg["auto_repatch_spotify"] = new_val
+        save_config(self.cfg)
+        self.notify(f"Auto re-patch after Spotify updates: {'ON' if new_val else 'OFF'}")
 
-    def capture_ad(self, *_args) -> None:
-        """
-        Learn-mode: the user just heard/saw an ad. Pause it, click this, and we
-        promote ad-shaped requests from the last 30s of traffic into
-        ``filters/spotify-learned.txt`` (deduped, persisted, reloaded live).
-        Commit that file to git to share your finds.
-        """
+    def test_ntfy(self, *_args) -> None:
         def worker():
-            added, rules, path = self.addon.capture_candidates(app="spotify", window_sec=30)
-            if added == 0:
-                self.notify(
-                    "No new ad-shaped requests in the last 30s. "
-                    "Try clicking sooner after the ad starts, or check blocked.log."
+            try:
+                fresh = load_config()
+                self.cfg.update(fresh)
+                topic = (self.cfg.get("ntfy_topic") or "").strip()
+                if not topic:
+                    self.notify("No ntfy_topic set in config.json.")
+                    return
+                ok = update_watcher.send_ntfy(
+                    topic, "Test push from Interceptify tray.",
+                    title="Interceptify test", tags=["test_tube"],
                 )
-                return
-            preview = "\n".join(rules[:5])
-            more = f"\n(+{added - 5} more)" if added > 5 else ""
-            self.notify(f"Captured {added} new rule(s) into {path.name}:\n{preview}{more}")
+                self.notify(f"ntfy.sh test {'sent' if ok else 'FAILED'} to {topic}")
+            except Exception as e:
+                self.notify(f"test_ntfy error: {e}")
         threading.Thread(target=worker, daemon=True).start()
 
-    def reload_filters(self, *_args) -> None:
-        try:
-            self.addon.engine.reload()
-            self.notify(f"Filters reloaded — {len(self.addon.engine.rules)} rules active")
-        except Exception as e:
-            self.notify(f"Reload failed: {e}")
+    # ---- Run at Windows startup ----------------------------------------
 
-    def view_blocked(self, *_args) -> None:
-        self.notify(self.addon.summary())
-        # Also open the raw log for detail
+    _RUN_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    _RUN_VALUE_NAME = "Interceptify"
+
+    def _autostart_command(self) -> str:
+        if getattr(sys, "frozen", False):
+            return f'"{sys.executable}"'
+        py = sys.executable
+        if py.lower().endswith("python.exe"):
+            pyw = py[:-10] + "pythonw.exe"
+            if Path(pyw).exists():
+                py = pyw
+        return f'"{py}" "{Path(__file__).resolve()}"'
+
+    def _is_autostart_enabled(self) -> bool:
         try:
-            if BLOCKED_LOG.exists():
-                os.startfile(str(BLOCKED_LOG))  # type: ignore[attr-defined]
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self._RUN_REG_PATH, 0, winreg.KEY_READ) as k:
+                val, _ = winreg.QueryValueEx(k, self._RUN_VALUE_NAME)
+                return bool(val)
+        except (FileNotFoundError, OSError):
+            return False
+
+    def toggle_autostart(self, *_args) -> None:
+        import winreg
+        currently_on = self._is_autostart_enabled()
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self._RUN_REG_PATH, 0,
+                                winreg.KEY_SET_VALUE) as k:
+                if currently_on:
+                    try:
+                        winreg.DeleteValue(k, self._RUN_VALUE_NAME)
+                    except FileNotFoundError:
+                        pass
+                    self.notify("Auto-start at Windows login: OFF")
+                else:
+                    winreg.SetValueEx(k, self._RUN_VALUE_NAME, 0, winreg.REG_SZ,
+                                      self._autostart_command())
+                    self.notify("Auto-start at Windows login: ON")
         except Exception as e:
-            log.warning("Open log failed: %s", e)
+            self.notify(f"Auto-start toggle failed: {e}")
+        self.refresh_icon()
+
+    # ---- Exit ----------------------------------------------------------
 
     def quit_app(self, *_args) -> None:
-        if self.active:
-            self.turn_off()
         if self.icon is not None:
             self.icon.stop()
 
-    # -- menu --------------------------------------------------------------
+    def _on_exit(self) -> None:
+        # Stop the optional Spotify-update watcher cleanly
+        if self._spotify_watcher is not None:
+            try:
+                self._spotify_watcher.stop()
+            except Exception:
+                pass
+
+    # ---- Menu ----------------------------------------------------------
 
     def build_menu(self) -> Menu:
-        return Menu(
-            Item("Toggle", self.toggle, default=True),
+        active = self._is_active()
+        toggle_label = (
+            "Unpatch Spotify (stop blocking ads)"
+            if active else
+            "Patch Spotify (start blocking ads)"
+        )
+        update_label = (
+            f"Install update {self._latest_release.tag}"
+            if self._latest_release else
+            "Install update"
+        )
+        items = [
+            Item(toggle_label, self.toggle, default=True),
+            Item(
+                update_label, self.install_update,
+                visible=lambda item: self._latest_release is not None,
+            ),
             Menu.SEPARATOR,
-            Item("🎵 Ad is playing — capture now", self.capture_ad),
-            Item("Reload filters", self.reload_filters),
-            Menu.SEPARATOR,
-            Item("Patch Spotify (client-side ad block)", self.patch_spotify),
-            Item("Unpatch Spotify", self.unpatch_spotify),
             Item(
                 "Show status dot in Spotify",
                 self.toggle_show_badge,
                 checked=lambda item: self._current_show_badge(),
             ),
+        ]
+        if HAS_UPDATE_WATCHER:
+            items.append(Item(
+                "Auto re-patch after Spotify updates",
+                self.toggle_auto_repatch,
+                checked=lambda item: bool(self.cfg.get("auto_repatch_spotify", False)),
+            ))
+            items.append(Item("Send test phone notification (ntfy.sh)", self.test_ntfy))
+        items.extend([
             Menu.SEPARATOR,
-            Item("Install certificate", self.install_cert),
-            Item("Uninstall certificate", self.uninstall_cert),
-            Item("Open filter rules", self.open_filters),
-            Item("Open bypass list", self.open_bypass),
-            Item("View blocked requests", self.view_blocked),
+            Item(
+                "Run at Windows startup",
+                self.toggle_autostart,
+                checked=lambda item: self._is_autostart_enabled(),
+            ),
             Menu.SEPARATOR,
             Item("Exit", self.quit_app),
-        )
+        ])
+        return Menu(*items)
 
     def run(self) -> None:
+        active = self._is_active()
         self.icon = pystray.Icon(
             APP_NAME,
-            icon=make_icon(False),
-            title=f"{APP_NAME}: OFF",
+            icon=make_icon(active),
+            title=f"{APP_NAME}: starting...",
             menu=self.build_menu(),
         )
+        # Initial tooltip + start the self-update poll
+        threading.Thread(target=self._poll_for_updates_loop, daemon=True).start()
+        if self._spotify_watcher is not None:
+            try:
+                self._spotify_watcher.start()
+            except Exception as e:
+                log.warning("Could not start Spotify-update watcher: %s", e)
+        # Refresh tooltip once icon exists
+        threading.Thread(target=lambda: (time.sleep(0.5), self.refresh_icon()), daemon=True).start()
         self.icon.run()
 
 
@@ -585,14 +595,7 @@ def main() -> None:
     if not is_admin():
         relaunch_as_admin()
         return
-    # Heal before constructing the app so any stale proxy state is gone first
-    self_heal_stale_proxy()
-    app = InterceptifyApp()
-    try:
-        app.run()
-    finally:
-        # Belt-and-braces on top of the atexit hook
-        app._emergency_restore()
+    InterceptifyApp().run()
 
 
 if __name__ == "__main__":

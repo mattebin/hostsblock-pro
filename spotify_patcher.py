@@ -119,16 +119,30 @@ def spotify_exe_path() -> Path:
     return candidates[0]
 
 
-def launch_spotify() -> bool:
-    """Start Spotify detached from our process. Returns True if launch attempted."""
+def launch_spotify(remote_debug_port: int = 9222) -> bool:
+    """
+    Start Spotify detached from our process.
+
+    Spotify is an Electron app. Passing ``--remote-debugging-port=N`` makes
+    its renderer expose a Chrome DevTools Protocol endpoint on localhost:N,
+    so we can attach DevTools from any Chromium browser even though
+    Spotify removed the Ctrl+Shift+I shortcut on recent builds.
+    Set ``remote_debug_port=0`` to disable.
+    """
     exe = spotify_exe_path()
     if not exe.exists():
         return False
     try:
         import subprocess
+        args = [str(exe)]
+        if remote_debug_port:
+            args.append(f"--remote-debugging-port={remote_debug_port}")
+            # Newer Chromium rejects WebSocket connections to the debug
+            # endpoint unless the Origin header is explicitly allowed.
+            args.append("--remote-allow-origins=*")
         # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP so Spotify outlives us
         subprocess.Popen(
-            [str(exe)], close_fds=True,
+            args, close_fds=True,
             creationflags=0x00000008 | 0x00000200,
         )
         return True

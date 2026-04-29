@@ -1,200 +1,87 @@
 # Interceptify
 
-A Windows tray app that runs an **embedded mitmproxy** to block ad & telemetry requests made by desktop apps — starting with **Spotify**. Extensible to any other app by dropping a filter file.
+A small Windows tray app that **blocks ads in the Spotify desktop client** by patching its UI bundle (`xpui.spa`). Detection runs inside Spotify itself: the moment an ad is queued, the patch clicks skip-forward, and if Spotify denies the skip, it mutes via Spotify's own volume control.
 
-> 🛑 **READ THIS FIRST — Spotify compatibility**
->
-> You need the **desktop installer** version of Spotify from **[spotify.com/download](https://www.spotify.com/download)**.
->
-> The **Microsoft Store version will NOT work** — it runs inside a Windows AppContainer sandbox that blocks loopback connections to `127.0.0.1` and ignores the system proxy. Interceptify can't reach it.
->
-> If you have the Store version: uninstall it, download the installer from spotify.com, sign in again. Same app, same library, no sandbox.
+> 🛑 **You need the desktop installer Spotify**, not the Microsoft Store version
+> Download from **[spotify.com/download](https://www.spotify.com/download)**. The Store version is sandboxed and the patcher can't touch it.
 
-> ⚠️ **Honest disclaimer.** This is a learning / hobby tool.
-> - **Spotify audio ads stream from the same CDN as music**, so they cannot be reliably blocked by URL filtering. Expect to still hear some audio ads.
-> - Spotify ships updates that rename endpoints — filters will need occasional tuning.
-> - Any future move to **certificate pinning** would break this entirely, with no workaround.
-> - If you want serious, maintained blocking: use [AdGuard](https://adguard.com/) or a Pi-hole.
-
-## How it works
-
-```
-  Spotify ──► Windows system proxy (127.0.0.1:8080) ──► mitmproxy (in-process)
-                                                              │
-                                      filters/spotify.txt  ◄──┤  match?
-                                                              ▼
-                                                  yes → 403 Blocked
-                                                   no → forward upstream
-```
-
-Toggling ON:
-1. Starts an in-process `mitmproxy.DumpMaster` with our `BlockerAddon` on `127.0.0.1:8080`.
-2. Snapshots and then overwrites the per-user WinINET proxy settings in the registry.
-3. Installs mitmproxy's auto-generated CA into the **Windows Trusted Root** store so HTTPS interception works (only on first run).
-
-Toggling OFF reverses all three.
+> ⚠️ **Honest limitations.** Read these before installing.
+> - Spotify auto-updates wipe the patch. Re-patch with one click after each update.
+> - Detection relies on Spotify's DOM test-ids (`leavebehind-advertiser`, `embedded-ad`, …). When Spotify renames them in a future build, ads may slip through until selectors are updated. Issues / PRs welcome.
+> - This is a hobby tool. If you want a maintained option for the full ecosystem, [Spicetify](https://spicetify.app/) is the bigger project.
 
 ## Install
 
-> ⚠️ Before installing: make sure you're using **Spotify from [spotify.com/download](https://www.spotify.com/download)**, not the Microsoft Store version. The Store version is sandboxed and won't work with this tool (see the note at the top).
-
-### Easy way — download the prebuilt exe
+### Easy — prebuilt .exe
 1. Grab **Interceptify.exe** from the [Releases page](https://github.com/mattebin/interceptify/releases).
-2. Double-click it. Accept the UAC prompt.
-3. Shield icon appears in your tray.
+2. Double-click. Accept the UAC prompt (needed to write to `%APPDATA%\Spotify\Apps\xpui.spa`).
+3. Right-click the tray shield → **Patch Spotify (start blocking ads)**.
 
-### From source (Python 3.10+)
+### From source
 ```bat
 pip install -r requirements.txt
 python main.py
 ```
-The app auto-elevates via UAC if launched without admin rights.
+The app auto-elevates via UAC.
 
-## Tray controls
+## Tray menu
 
-| Action          | Result                                                          |
-|-----------------|-----------------------------------------------------------------|
-| Left-click      | Toggle blocking ON (green ✓) / OFF (grey ✕)                    |
-| **Toggle**      | Same as left-click                                              |
-| **🎵 Ad is playing — capture now** | Learn mode. Click this the moment an ad plays — see below |
-| **Reload filters** | Re-reads all files in `filters/` without restarting          |
-| **Patch Spotify (client-side ad block)** | Injects our JS into Spotify's `xpui.spa` to detect ads in the UI and auto-skip or mute them. Closes + relaunches Spotify. See [Client-side patching](#client-side-patching) |
-| **Unpatch Spotify** | Restores Spotify's original `xpui.spa` from backup. Closes + relaunches Spotify. |
-| **Show status dot in Spotify** | Checkbox. When patched, a small dot in Spotify's top bar shows ad-block state (green idle / red ad / orange network-block). Purely cosmetic. |
-| **Install certificate** | Re-install mitmproxy CA (if you cleared it manually)    |
-| **Open filter rules**   | Opens `filters/` in Explorer so you can edit rules      |
-| **Open bypass list**    | Opens `bypass.txt` — hosts that should never be intercepted |
-| **View blocked requests** | Toast with per-app counts + opens `blocked.log`       |
-| **Exit**        | Stops proxy, restores system proxy, quits                       |
+| Item | What it does |
+|---|---|
+| **Patch Spotify** / **Unpatch Spotify** | Injects (or removes) the ad-block JS in `xpui.spa`. Closes & relaunches Spotify. |
+| **Install update vX.Y.Z** | Appears when a newer release is on GitHub. Auto-downloads + restarts. |
+| **Show status dot in Spotify** | Toggles the small dot in Spotify's top-right that shows ad-block state (green = idle, red = ad detected). |
+| **Run at Windows startup** | Adds Interceptify to your `HKCU\…\Run` so it's always there to re-patch after Spotify updates. |
+| **Exit** | Quits the tray (the patch stays applied). |
 
-## Learn mode — teach it what an ad looks like
+## How it works
 
-The proxy keeps a **rolling 60-second buffer** of every request Spotify makes that wasn't already blocked. When you hear an ad:
+1. **Patch on disk.** `spotify_patcher.py` opens `%APPDATA%\Spotify\Apps\xpui.spa` (a ZIP), backs up the pristine version once to `xpui.spa.interceptify-backup`, injects an inline `<script>` tag into `index.html`, and re-zips. The script is `extensions/adblock.js`.
 
-1. **Pause Spotify** the moment you notice the ad.
-2. Right-click the tray icon → **🎵 Ad is playing — capture now**.
-3. Interceptify scans the last 30 s of traffic and keeps entries that are:
-   - on a known ad-network host, **or**
-   - under an ad-shaped path (`/ads/`, `/promo/`, `/tracking/`, `/pixel`, …), **or**
-   - an audio/video response (the actual ad stream).
-4. New rules are appended to **`filters/spotify-learned.txt`** (deduped against existing rules), the engine reloads, and a toast shows what was added.
-5. `apps.json` is updated automatically so the learned file is always loaded.
+2. **Detection inside Spotify.** When you launch Spotify, our JS runs. It:
+   - Polls the DOM every 500 ms for ad-related test-ids (the `leavebehind-*` family, `embedded-ad`, `ads-video-player-npv`, `canvas-ad-player`, etc.)
+   - Hooks any object's `.on()` / `.emit()` looking for Spotify's own `'adplaying'` / `'adbreakstart'` events
+   - Checks for elements whose class or text says "Advertisement"
+   - Falls back to a heuristic: short audio + bare "Spotify" document title
 
-**This is the file you commit to git** — share your captures by pushing:
+3. **Action when an ad fires.**
+   - Click `[data-testid="control-button-skip-forward"]` — works pre-audio
+   - If skip denied, click `[data-testid="volume-bar-toggle-mute-button"]` — silences the ad. State-tracked so we don't override your manual mute.
+   - Visual ad slots (`home-ad-card`, `embedded-ad-carousel`, …) are hidden via injected CSS.
 
-```bat
-git add filters/spotify-learned.txt apps.json
-git commit -m "Add learned Spotify ad endpoints"
-git push
+## Detective / debug
+
+Spotify recent builds removed Ctrl+Shift+I, gating DevTools behind a server-side employee flag. Interceptify launches Spotify with `--remote-debugging-port=9222 --remote-allow-origins=*` so you can attach DevTools from any Chromium browser:
+
+```
+http://127.0.0.1:9222
 ```
 
-Review the file before committing — the heuristics are conservative but not perfect. Remove anything that looks like legit music/auth traffic.
-
-## Bypass list (don't intercept these)
-
-Some apps refuse to trust the mitmproxy CA — they ship their own CA bundle (Node/Electron tools, Python `certifi`, Go binaries) or do certificate pinning (banking apps, the Anthropic API, OpenAI API). When a proxy tries to MITM them they throw `tlsv1 alert unknown ca` and refuse to talk.
-
-`bypass.txt` lists hosts that should **never** be intercepted — Windows routes their traffic directly. Pre-filled with common APIs (Anthropic, OpenAI, GitHub, npm, PyPI, banking, etc.). Edit via tray menu → **Open bypass list**, then toggle OFF/ON to apply.
-
-```text
-# bypass.txt
-api.anthropic.com
-*.openai.com
-api.github.com
-*.paypal.com
+In the DevTools console you have:
+```js
+__interceptify.status()    // detection counters
+__interceptify.scanAds()   // ad-shaped elements right now
+__interceptify.testIds()   // every data-testid in the DOM
 ```
 
-## Client-side patching
-
-The proxy alone blocks ad *metadata* requests but can't stop Spotify's audio ads (they stream from the same CDN as music, indistinguishable by URL). To actually silence them, Interceptify can inject a small JS file into Spotify's own UI bundle.
-
-**What it does**
-- Hooks `fetch` / `XHR` inside Spotify and returns 403 for ad URLs — belt-and-braces with the network proxy.
-- Polls Spotify's DOM for ad markers. When an ad track starts, it clicks Spotify's own skip-forward button; if that's rate-limited (Free accounts cap skips), it mutes the `<audio>` element instead.
-- Optionally shows a small status dot in Spotify's top bar — green when idle, red when an ad is detected, orange when a network ad request just got blocked.
-
-**How to use**
-1. Tray → **Patch Spotify (client-side ad block)**. Interceptify closes Spotify, modifies `xpui.spa` (backed up to `xpui.spa.interceptify-backup`), and relaunches Spotify.
-2. To roll back: **Unpatch Spotify** restores the original bundle.
-
-**Limitations (honest)**
-- Spotify auto-updates wipe the patch. Interceptify detects this on next patch and re-injects cleanly — just hit **Patch Spotify** again after an update.
-- We detect ads via stable-ish DOM selectors (`data-testid="context-item-info-ad-title"`, etc.). If Spotify renames these in a future build, ads may play audibly until the selectors are updated in `extensions/adblock.js`.
-- DevTools is unlocked by the patcher (Ctrl+Shift+I) if you want to inspect what the injected script is doing.
-
-## Filter syntax
-
-One rule per line in `filters/<appname>.txt`. Lines starting with `#` are comments.
-
-| Rule form                    | Matches                                    |
-|------------------------------|--------------------------------------------|
-| `example.com`                | That host, exactly, or any subdomain of it |
-| `example.com/ads/`           | That host AND a URL path starting with `/ads/` |
-| `*/tracking/*`               | Any request whose path contains `/tracking/` |
-| `re:^https://.*/pixel\?id=`  | Python regex against the full URL          |
-
-## Adding a new app
-
-1. Create `filters/<appname>.txt` and add rules.
-2. Add an entry to `apps.json`:
-
-   ```json
-   {
-     "apps": {
-       "spotify": { "filter_file": "filters/spotify.txt", "enabled": true },
-       "discord":  { "filter_file": "filters/discord.txt",  "enabled": true }
-     }
-   }
-   ```
-
-3. Restart the app. New rules are loaded automatically.
-
-For per-app logic more complex than URL blocking (e.g. rewriting JSON response bodies to strip inline ads), see the commented `response()` hook in `proxy_addon.py`.
-
-## Test plan — verify the proxy is live
-
-1. Toggle Interceptify **ON**.
-2. In any browser using the system proxy (Edge, Chrome), go to **http://mitm.it** — the mitmproxy landing page should load, proving traffic is being intercepted.
-3. Visit **https://example.com** — it should load cleanly (cert chain will show "mitmproxy" as the issuer — that's expected).
-4. Play Spotify for a bit. Right-click the tray icon → **View blocked requests** — you should see a count for `spotify` and entries in `blocked.log` like:
-
-   ```
-   2026-04-17T16:24:11 [spotify] GET https://spclient.wg.spotify.com/ads/v1/... <- spclient.wg.spotify.com/ads/
-   ```
-
-5. Toggle OFF. Visit mitm.it again — it should fail, proving the proxy was removed cleanly.
-
-## Troubleshooting (Spotify specifically)
-
-| Symptom                                  | Likely cause / fix                                                        |
-|------------------------------------------|---------------------------------------------------------------------------|
-| Ads still play (audio)                   | Audio ads share the music CDN — URL filtering can't distinguish them.     |
-| "Spotify can't connect" / login fails    | Spotify may be doing cert pinning on its auth endpoints. Add those hosts to a `bypass` list by commenting out rules and restarting. |
-| Nothing appears in `blocked.log`         | Confirm system proxy is set: `netsh winhttp show proxy`. Visit mitm.it.   |
-| Browser shows cert warnings              | The CA install didn't succeed. Run **Install certificate** from the menu. |
-| After uninstall, system can't reach the internet | Toggle OFF first! If you closed it mid-ON: open Settings → Network → Proxy → turn off Manual proxy. |
-
-## Build a single `.exe`
+## Building yourself
 
 ```bat
-pip install pyinstaller
+pip install -r requirements.txt pyinstaller
 pyinstaller --noconfirm --onefile --windowed ^
   --name "Interceptify" ^
   --manifest interceptify.manifest ^
   --uac-admin ^
-  --add-data "filters;filters" ^
-  --add-data "apps.json;." ^
+  --add-data "extensions;extensions" ^
   main.py
 ```
 
-The `.exe` lands in `dist\Interceptify.exe`.
-
-## Security note
-
-Installing a local root CA is a **genuine security tradeoff**: any software running as your user on this machine could (in theory) read the mitmproxy private key from `%USERPROFILE%\.mitmproxy\` and MITM your traffic. Only run tools you trust.
-
-To cleanly remove the CA later: `certutil -delstore ROOT mitmproxy` from an elevated prompt.
+Output: `dist\Interceptify.exe`
 
 ## License
 
-[MIT](LICENSE)
+MIT — see [LICENSE](LICENSE).
+
+## Notes
+
+Earlier Interceptify releases (≤ v1.4.0) shipped a mitmproxy + Windows-system-proxy pipeline that filtered ad URLs at the network level. Spotify 1.2.88+ stopped using the Windows proxy for its API and audio traffic, so that pipeline no longer affects Spotify and was removed in v1.5.0. The xpui patch is the only working layer on modern Spotify.
