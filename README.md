@@ -1,13 +1,14 @@
 # Interceptify
 
-A small Windows tray app that **blocks ads in the Spotify desktop client** by patching its UI bundle (`xpui.spa`). Detection runs inside Spotify itself: the moment an ad is queued, the patch clicks skip-forward, and if Spotify denies the skip, it mutes via Spotify's own volume control.
+A small Windows tray app that **blocks ads in the Spotify desktop client** by patching its UI bundle (`xpui.spa`). Two layers do the work: a **pre-player block** that stops ad audio data from ever reaching the player, plus an in-player skip/mute fallback that catches anything the first layer misses.
 
 > 🛑 **You need the desktop installer Spotify**, not the Microsoft Store version
 > Download from **[spotify.com/download](https://www.spotify.com/download)**. The Store version is sandboxed and the patcher can't touch it.
 
-> ⚠️ **Honest limitations.** Read these before installing.
+> ⚠️ **Honest limitations.**
 > - Spotify auto-updates wipe the patch. Re-patch with one click after each update.
-> - Detection relies on Spotify's DOM test-ids (`leavebehind-advertiser`, `embedded-ad`, …). When Spotify renames them in a future build, ads may slip through until selectors are updated. Issues / PRs welcome.
+> - The pre-player block relies on a stable Spotify endpoint shape (`/manifests/v9/json/sources/.../options`). When Spotify changes that, ads will start coming through until the heuristic is updated.
+> - The in-player skip layer relies on DOM test-ids. Same caveat.
 > - This is a hobby tool. If you want a maintained option for the full ecosystem, [Spicetify](https://spicetify.app/) is the bigger project.
 
 ## Install
@@ -36,18 +37,38 @@ The app auto-elevates via UAC.
 
 ## How it works
 
-1. **Patch on disk.** `spotify_patcher.py` opens `%APPDATA%\Spotify\Apps\xpui.spa` (a ZIP), backs up the pristine version once to `xpui.spa.interceptify-backup`, injects an inline `<script>` tag into `index.html`, and re-zips. The script is `extensions/adblock.js`.
+The patcher unzips Spotify's `xpui.spa`, injects an inline `<script>` of `extensions/adblock.js` into `index.html`, and re-zips. Original is preserved at `xpui.spa.interceptify-backup`. When Spotify launches, our script runs **before** Spotify's deferred `xpui-snapshot.js` — so we can hook fetch, WebSocket, MediaSource, etc. before the player code does anything.
 
-2. **Detection inside Spotify.** When you launch Spotify, our JS runs. It:
-   - Polls the DOM every 500 ms for ad-related test-ids (the `leavebehind-*` family, `embedded-ad`, `ads-video-player-npv`, `canvas-ad-player`, etc.)
-   - Hooks any object's `.on()` / `.emit()` looking for Spotify's own `'adplaying'` / `'adbreakstart'` events
-   - Checks for elements whose class or text says "Advertisement"
-   - Falls back to a heuristic: short audio + bare "Spotify" document title
+### Layer 1 — Pre-player block (the source of truth)
 
-3. **Action when an ad fires.**
-   - Click `[data-testid="control-button-skip-forward"]` — works pre-audio
-   - If skip denied, click `[data-testid="volume-bar-toggle-mute-button"]` — silences the ad. State-tracked so we don't override your manual mute.
-   - Visual ad slots (`home-ad-card`, `embedded-ad-carousel`, …) are hidden via injected CSS.
+Three fetch interceptors that prevent Spotify from ever loading ad data:
+
+| Endpoint | What we do |
+|---|---|
+| `/sponsoredplaylist/v1/sponsored` | Return `{"sponsorships":[]}`. Spotify has no sponsored playlists to inject. |
+| `/manifests/v9/json/sources/<srcId>/options/...` | Inspect the response. If `end_time_millis < 60000` (= the manifest is for a clip < 60 seconds, i.e. an ad), **rewrite the response to `{"contents":[]}`** AND remember the `srcId`. |
+| `/sources/<srcId>/...` segment fetches | If `srcId` is on our remembered ad-source list, return **404**. The ad's audio chunks never load. |
+
+**Why it works:** Spotify identifies what to play via `/manifests/v9/json/sources/<id>/options/`. The response includes `end_time_millis`. Music is 200,000–500,000 ms (3–8 min). Ads are <60,000 ms (10–30 sec). That single field is the cleanest discriminator we found across hours of network capture.
+
+### Layer 2 — In-player detection + skip (fallback)
+
+If anything slips past Layer 1, this catches it:
+
+- **Detection** (DOM polling every 500 ms + Spotify's own `'adplaying'`/`'adbreakstart'` events):
+  `leavebehind-advertiser`, `embedded-ad`, `ads-video-player-npv`, `canvas-ad-player`, `ad-controls`, `ad-companion-card`, `video-takeover-link`, plus heuristics on `<title>` and short audio.
+- **Action** (fires every 500 ms while an ad is detected):
+  - Click `control-button-seek-forward-15` repeatedly (drains podcast-style ads in <1 s)
+  - Click `control-button-skip-forward` (works for some ad types)
+  - Set the progress slider `<input type="range">` to `max`
+  - Pointer-click the far right of the progress bar
+  - Fire `ArrowRight` / `Shift+ArrowRight` / `End` keyboard events
+  - On `<video>` ads: set `playbackRate=16`, `currentTime=duration`, dispatch synthetic `'ended'`
+  - Mute via Spotify's volume button (state-tracked so we don't fight your manual mute)
+  - Call `endOfStream()` on every active `MediaSource`
+  - Hide visual ad surfaces (`home-ad-card`, `embedded-ad-carousel`, …) via CSS
+
+A `safeSkip` guard wraps `HTMLElement.click()` so our action loop can never click `skip-forward` on a real music track during the ad→music transition tick.
 
 ## Detective / debug
 
@@ -62,6 +83,13 @@ In the DevTools console you have:
 __interceptify.status()    // detection counters
 __interceptify.scanAds()   // ad-shaped elements right now
 __interceptify.testIds()   // every data-testid in the DOM
+```
+
+Plus — an in-page sniffer logs every fetch / XHR / WebSocket / MediaSource / sendBeacon event and tags them with whether an ad was active when fired. Useful for diagnosing new Spotify ad-delivery paths:
+```js
+window.__interceptify_sniffer        // ring buffer of all events
+window.__interceptify_meta_log       // captured response bodies (manifests, metadata, pathfinder, sponsoredplaylist)
+window.__interceptify_known_ad_sources  // set of srcIds classified as ad
 ```
 
 ## Building yourself
@@ -85,3 +113,5 @@ MIT — see [LICENSE](LICENSE).
 ## Notes
 
 Earlier Interceptify releases (≤ v1.4.0) shipped a mitmproxy + Windows-system-proxy pipeline that filtered ad URLs at the network level. Spotify 1.2.88+ stopped using the Windows proxy for its API and audio traffic, so that pipeline no longer affects Spotify and was removed in v1.5.0. The xpui patch is the only working layer on modern Spotify.
+
+v1.5.2 added the manifest-based source-of-truth pre-player block after a 1-hour network capture revealed `end_time_millis` in the manifest response as the cleanest ad-vs-music discriminator.

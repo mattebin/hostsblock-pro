@@ -38,3 +38,6 @@ afk_monitor.py
 afk_monitor.log
 cdp_eval.py
 diag_*.py
+hotfix_*.py
+dump_run.py
+run_dump_*.json
