@@ -121,6 +121,14 @@
       }, (ms || 2500) + 50);
     } catch {}
   }
+
+  function clearExpiredSuppressionCss() {
+    try {
+      if (Date.now() >= (window.__interceptify_suppress_ad_ui_until || 0)) {
+        document.documentElement.removeAttribute("data-interceptify-ad-suppressed");
+      }
+    } catch {}
+  }
   installSuppressionCss();
 
   function extractManifestMaxEnd(text) {
@@ -225,10 +233,8 @@
       });
       window.__interceptify_instream_ad_until = Date.now() + 3000;
       try {
-        window.__interceptify_ad_active = true;
-        setBadgeState("ad");
-        muteAllAudio(true);
-        applyAdActiveGains(true);
+        setBadgeState("blocked");
+        scheduleTransientAdCleanup(3500, "instream-ad");
       } catch {}
     } catch {}
   }
@@ -1612,12 +1618,29 @@
     return null;
   }
   let _weMuted = false;
+  const _mediaVolumeBeforeMute = new WeakMap();
   function muteAllAudio(shouldBeMuted) {
     // Best-effort no-op fallback for any media elements that DO exist
     // (rare in modern Spotify but cheap to keep).
     document.querySelectorAll("audio, video").forEach((el) => {
-      el.muted = shouldBeMuted;
-      if (shouldBeMuted) el.volume = 0;
+      try {
+        if (shouldBeMuted) {
+          if (!_mediaVolumeBeforeMute.has(el)) {
+            _mediaVolumeBeforeMute.set(el, { muted: el.muted, volume: el.volume });
+          }
+          el.muted = true;
+          el.volume = 0;
+        } else {
+          const prior = _mediaVolumeBeforeMute.get(el);
+          if (prior) {
+            el.muted = prior.muted;
+            el.volume = prior.volume;
+            _mediaVolumeBeforeMute.delete(el);
+          } else {
+            el.muted = false;
+          }
+        }
+      } catch {}
     });
     const btn = _muteButton();
     if (!btn) return;
@@ -1654,21 +1677,62 @@
   let stats = { detections: 0, lastDetection: null, lastSelector: null,
                 fetchBlocked: 0, xhrBlocked: 0 };
 
+  function releaseAdState(reason) {
+    try {
+      log("ad cleanup:", reason);
+      setBadgeState("idle");
+      muteAllAudio(false);
+      window.__interceptify_ad_active = false;
+      applyAdActiveGains(false);
+      clearExpiredSuppressionCss();
+    } catch {}
+  }
+
+  function cleanupExpiredTransientAd(reason) {
+    try {
+      clearExpiredSuppressionCss();
+      const instreamExpired =
+        !!window.__interceptify_instream_ad_until &&
+        Date.now() >= window.__interceptify_instream_ad_until;
+      if (instreamExpired && wasAd === "instream-ad-object") {
+        wasAd = null;
+        releaseAdState(reason || "instream-expired");
+      }
+    } catch {}
+  }
+
+  function scheduleTransientAdCleanup(ms, reason) {
+    try {
+      setTimeout(() => cleanupExpiredTransientAd(reason), ms || 3500);
+    } catch {}
+  }
+
+  try {
+    document.addEventListener("visibilitychange", () => cleanupExpiredTransientAd("visibilitychange"), true);
+    window.addEventListener("focus", () => cleanupExpiredTransientAd("focus"), true);
+    window.addEventListener("pageshow", () => cleanupExpiredTransientAd("pageshow"), true);
+  } catch {}
+
   function check() {
     const detected = isAdPlaying();
     if (detected) {
+      const instreamOnly = detected === "instream-ad-object";
       if (!wasAd) {
         stats.detections++;
         stats.lastDetection = new Date().toISOString();
         stats.lastSelector = detected;
         log("ad detected via:", detected);
         captureAdPlay(detected);
-        setBadgeState("ad");
-        muteAllAudio(true);
-        // Flip the low-level switch -- mutes every existing AudioContext
-        // master gain to 0 and arms the video.play() / video.src hijacks.
-        window.__interceptify_ad_active = true;
-        applyAdActiveGains(true);
+        setBadgeState(instreamOnly ? "blocked" : "ad");
+        if (instreamOnly) {
+          scheduleTransientAdCleanup(3500, "instream-check");
+        } else {
+          muteAllAudio(true);
+          // Flip the low-level switch -- mutes every existing AudioContext
+          // master gain to 0 and arms the video.play() / video.src hijacks.
+          window.__interceptify_ad_active = true;
+          applyAdActiveGains(true);
+        }
       }
       // KITCHEN SINK: fire every conceivable skip + mute mechanism on
       // every detection tick. Don't differentiate by ad type, don't try
@@ -1681,11 +1745,9 @@
       // across the ad-to-song transition, which can stall the next track.
     } else if (!detected && wasAd) {
       log("ad ended");
-      setBadgeState("idle");
-      muteAllAudio(false);
-      window.__interceptify_ad_active = false;
-      applyAdActiveGains(false);
+      releaseAdState("check-ended");
     }
+    cleanupExpiredTransientAd("check");
     wasAd = detected;
   }
 
