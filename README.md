@@ -1,14 +1,14 @@
 # Interceptify
 
-A small Windows tray app that **blocks ads in the Spotify desktop client** by patching its UI bundle (`xpui.spa`). Two layers do the work: a **pre-player block** that stops ad audio data from ever reaching the player, plus an in-player skip/mute fallback that catches anything the first layer misses.
+A small Windows tray app that **blocks ads in the Spotify desktop client** by patching its UI bundle (`xpui.spa`). The current build blocks Spotify's in-stream ad payloads before they reach the visible player, suppresses the ad UI during the skip window, and keeps the older manifest/DOM fallback layers for extra coverage.
 
 > 🛑 **You need the desktop installer Spotify**, not the Microsoft Store version
 > Download from **[spotify.com/download](https://www.spotify.com/download)**. The Store version is sandboxed and the patcher can't touch it.
 
 > ⚠️ **Honest limitations.**
 > - Spotify auto-updates wipe the patch. Re-patch with one click after each update.
-> - The pre-player block relies on a stable Spotify endpoint shape (`/manifests/v9/json/sources/.../options`). When Spotify changes that, ads will start coming through until the heuristic is updated.
-> - The in-player skip layer relies on DOM test-ids. Same caveat.
+> - The in-stream payload block relies on Spotify's current `inStreamApi` shape. When Spotify changes that, ads may start coming through until the hook is updated.
+> - The fallback manifest and DOM layers rely on endpoint fields and test-ids. Same caveat.
 > - This is a hobby tool. If you want a maintained option for the full ecosystem, [Spicetify](https://spicetify.app/) is the bigger project.
 
 ## Install
@@ -39,9 +39,20 @@ The app auto-elevates via UAC.
 
 The patcher unzips Spotify's `xpui.spa`, injects an inline `<script>` of `extensions/adblock.js` into `index.html`, and re-zips. Original is preserved at `xpui.spa.interceptify-backup`. When Spotify launches, our script runs **before** Spotify's deferred `xpui-snapshot.js` — so we can hook fetch, WebSocket, MediaSource, etc. before the player code does anything.
 
-### Layer 1 — Pre-player block (the source of truth)
+### Layer 1 — In-stream payload block
 
-Three fetch interceptors that prevent Spotify from ever loading ad data:
+The primary block hooks Spotify's renderer-side in-stream ad provider before the ad reaches the visible player:
+
+| Signal | What we do |
+|---|---|
+| `inStreamApi.onAdMessageCallbacks` | Wrap callback listeners and swallow messages whose payload contains Spotify Ad Server metadata. |
+| `inStreamApi.inStreamAd` | Clear ad objects as soon as Spotify writes them into the active in-stream state slot. |
+| `getInStreamAd()` | Return `null` for ad objects and call `skipToNext()` once per ad payload. |
+| Ad UI flash window | Temporarily suppress now-playing/ad widgets so an auto-skipped ad does not visibly flash. |
+
+### Layer 2 — Manifest pre-player block
+
+Fetch interceptors prevent known short ad manifests and their segments from loading:
 
 | Endpoint | What we do |
 |---|---|
@@ -51,7 +62,7 @@ Three fetch interceptors that prevent Spotify from ever loading ad data:
 
 **Why it works:** Spotify identifies what to play via `/manifests/v9/json/sources/<id>/options/`. The response includes `end_time_millis`. Music is 200,000–500,000 ms (3–8 min). Ads are <60,000 ms (10–30 sec). That single field is the cleanest discriminator we found across hours of network capture.
 
-### Layer 2 — In-player detection + skip (fallback)
+### Layer 3 — In-player detection + skip (fallback)
 
 If anything slips past Layer 1, this catches it:
 
@@ -114,4 +125,6 @@ MIT — see [LICENSE](LICENSE).
 
 Earlier Interceptify releases (≤ v1.4.0) shipped a mitmproxy + Windows-system-proxy pipeline that filtered ad URLs at the network level. Spotify 1.2.88+ stopped using the Windows proxy for its API and audio traffic, so that pipeline no longer affects Spotify and was removed in v1.5.0. The xpui patch is the only working layer on modern Spotify.
 
-v1.5.2 added the manifest-based source-of-truth pre-player block after a 1-hour network capture revealed `end_time_millis` in the manifest response as the cleanest ad-vs-music discriminator.
+v1.5.2 added the manifest-based pre-player block after a network capture revealed `end_time_millis` in the manifest response as a useful ad-vs-music discriminator.
+
+v1.5.3 adds the in-stream payload block that wraps Spotify's renderer ad provider, swallows ad callback payloads, clears `inStreamAd`, and suppresses the brief ad UI flash during auto-skip.
