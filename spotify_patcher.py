@@ -119,7 +119,7 @@ def spotify_exe_path() -> Path:
     return candidates[0]
 
 
-def launch_spotify(remote_debug_port: int = 9222) -> bool:
+def launch_spotify(remote_debug_port: int = 0) -> bool:
     """
     Start Spotify detached from our process.
 
@@ -153,7 +153,7 @@ def launch_spotify(remote_debug_port: int = 9222) -> bool:
 
 # ---------------------------------------------------------------------------
 
-def patch(show_badge: bool = True) -> tuple[bool, str]:
+def patch(show_badge: bool = True, debug_capture: bool = False) -> tuple[bool, str]:
     """
     Inject our ad-handler JS into Spotify's xpui.spa. Idempotent.
 
@@ -200,9 +200,12 @@ def patch(show_badge: bool = True) -> tuple[bool, str]:
                     # restrictions Spotify's resource handler may apply to
                     # arbitrarily-named script files.
                     js_body = adblock_src.read_text(encoding="utf-8")
-                    # Bake in the show-badge preference at patch time; the JS
-                    # reads window.__INTERCEPTIFY_SHOW_BADGE.
-                    prelude = f"window.__INTERCEPTIFY_SHOW_BADGE = {str(bool(show_badge)).lower()};\n"
+                    # Bake runtime preferences at patch time. The JS reads
+                    # these globals before installing hooks.
+                    prelude = (
+                        f"window.__INTERCEPTIFY_SHOW_BADGE = {str(bool(show_badge)).lower()};\n"
+                        f"window.__INTERCEPTIFY_DEBUG_CAPTURE = {str(bool(debug_capture)).lower()};\n"
+                    )
                     inject = (
                         f"{MARKER}\n"
                         f"<script data-interceptify=\"inline\">\n"

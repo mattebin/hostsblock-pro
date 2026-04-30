@@ -17,6 +17,8 @@
 (function () {
   const TAG = "[interceptify]";
   const log = (...a) => console.log(TAG, ...a);
+  const DEBUG_CAPTURE = window.__INTERCEPTIFY_DEBUG_CAPTURE === true;
+  const blockInStreamSignal = () => window.__INTERCEPTIFY_BLOCK_INSTREAM_SIGNAL !== false;
 
   // ===================================================================
   // EARLY HOOKS — must install before Spotify's deferred xpui-snapshot.js
@@ -28,8 +30,18 @@
   window.__interceptify_sniffer = window.__interceptify_sniffer || [];
   window.__interceptify_meta_log = window.__interceptify_meta_log || [];
   window.__interceptify_mediasources = window.__interceptify_mediasources || new Set();
+  window.__interceptify_known_ad_sources = window.__interceptify_known_ad_sources || new Set();
+  window.__interceptify_ad_intel = window.__interceptify_ad_intel || {
+    manifests: [],
+    blockedSources: [],
+    blockedSegments: [],
+    instreamAds: [],
+    instreamApiCalls: [],
+    adPlays: [],
+  };
 
   function snifferLog(kind, info) {
+    if (!DEBUG_CAPTURE) return;
     try {
       window.__interceptify_sniffer.push({
         ts: Date.now(),
@@ -40,6 +52,596 @@
         window.__interceptify_sniffer = window.__interceptify_sniffer.slice(-4000);
     } catch {}
   }
+
+  function nowPlayingSnapshot() {
+    try {
+      const title =
+        document.querySelector('[data-testid="context-item-link"]') ||
+        document.querySelector('[data-testid="context-item-info-title"]') ||
+        document.querySelector('[data-testid="now-playing-widget"] a');
+      const subtitle =
+        document.querySelector('[data-testid="context-item-info-subtitle"]') ||
+        document.querySelector('[data-testid="context-item-info-ad-subtitle"]');
+      return {
+        documentTitle: document.title,
+        title: (title && title.textContent || "").trim().slice(0, 160),
+        subtitle: (subtitle && subtitle.textContent || "").trim().slice(0, 160),
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  function rememberIntel(bucket, info) {
+    if (!DEBUG_CAPTURE) return;
+    try {
+      const intel = window.__interceptify_ad_intel;
+      const arr = intel[bucket] || (intel[bucket] = []);
+      arr.push({
+        ts: Date.now(),
+        adActive: !!window.__interceptify_ad_active,
+        nowPlaying: nowPlayingSnapshot(),
+        ...info,
+      });
+      if (arr.length > 200) intel[bucket] = arr.slice(-120);
+    } catch {}
+  }
+
+  function installSuppressionCss() {
+    try {
+      if (document.getElementById("interceptify-suppress-css")) return;
+      const style = document.createElement("style");
+      style.id = "interceptify-suppress-css";
+      style.textContent = [
+        'html[data-interceptify-ad-suppressed="true"] [data-testid*="ad" i] { display:none !important; visibility:hidden !important; opacity:0 !important; pointer-events:none !important; }',
+        'html[data-interceptify-ad-suppressed="true"] [data-testid*="sponsor" i] { display:none !important; visibility:hidden !important; opacity:0 !important; pointer-events:none !important; }',
+        'html[data-interceptify-ad-suppressed="true"] [data-testid*="premium" i] { display:none !important; visibility:hidden !important; opacity:0 !important; pointer-events:none !important; }',
+        'html[data-interceptify-ad-suppressed="true"] [data-testid="context-item-info"] { visibility:hidden !important; opacity:0 !important; }',
+        'html[data-interceptify-ad-suppressed="true"] [data-testid="now-playing-widget"] { visibility:hidden !important; opacity:0 !important; }',
+        'html[data-interceptify-ad-suppressed="true"] [data-testid="now-playing-bar"] a[href*="/premium"] { display:none !important; }',
+        'html[data-interceptify-ad-suppressed="true"] iframe[src*="ad"], html[data-interceptify-ad-suppressed="true"] iframe[id*="ad"] { display:none !important; visibility:hidden !important; }',
+      ].join("\n");
+      (document.head || document.documentElement).appendChild(style);
+    } catch {}
+  }
+
+  function suppressAdUi(reason, ms) {
+    try {
+      installSuppressionCss();
+      const until = Date.now() + (ms || 2500);
+      window.__interceptify_suppress_ad_ui_until = Math.max(window.__interceptify_suppress_ad_ui_until || 0, until);
+      document.documentElement.setAttribute("data-interceptify-ad-suppressed", "true");
+      snifferLog("ad-ui-suppress", { reason, until });
+      setTimeout(() => {
+        try {
+          if (Date.now() >= (window.__interceptify_suppress_ad_ui_until || 0)) {
+            document.documentElement.removeAttribute("data-interceptify-ad-suppressed");
+          }
+        } catch {}
+      }, (ms || 2500) + 50);
+    } catch {}
+  }
+  installSuppressionCss();
+
+  function extractManifestMaxEnd(text) {
+    let maxEnd = 0;
+    try {
+      const visit = (v) => {
+        if (!v || typeof v !== "object") return;
+        if (typeof v.end_time_millis === "number") maxEnd = Math.max(maxEnd, v.end_time_millis);
+        if (typeof v.duration_millis === "number") maxEnd = Math.max(maxEnd, v.duration_millis);
+        if (typeof v.duration_ms === "number") maxEnd = Math.max(maxEnd, v.duration_ms);
+        if (Array.isArray(v)) {
+          v.forEach(visit);
+        } else {
+          Object.keys(v).forEach((k) => visit(v[k]));
+        }
+      };
+      visit(JSON.parse(text));
+    } catch {}
+    try {
+      const matches = text.match(/"(?:end_time_millis|duration_millis|duration_ms)"\s*:\s*(\d+)/g) || [];
+      for (const m of matches) {
+        const n = parseInt((m.match(/(\d+)/) || [0, 0])[1], 10);
+        if (Number.isFinite(n)) maxEnd = Math.max(maxEnd, n);
+      }
+    } catch {}
+    return maxEnd;
+  }
+
+  function emptyManifestResponse() {
+    return new Response(
+      JSON.stringify({ contents: [] }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  function compactValue(value, depth = 0) {
+    if (value == null) return value;
+    if (typeof value === "string") return value.slice(0, 600);
+    if (typeof value === "number" || typeof value === "boolean") return value;
+    if (typeof value === "function") return "[Function]";
+    if (depth > 3) return "[DepthLimit]";
+    if (Array.isArray(value)) return value.slice(0, 20).map((v) => compactValue(v, depth + 1));
+    if (typeof value === "object") {
+      const out = {};
+      Object.keys(value).slice(0, 80).forEach((k) => {
+        try { out[k] = compactValue(value[k], depth + 1); } catch {}
+      });
+      return out;
+    }
+    return String(value).slice(0, 200);
+  }
+
+  function summarizeAdObject(ad) {
+    if (!ad || typeof ad !== "object") return null;
+    const metadata = ad.metadata || {};
+    const summary = {
+      id: ad.id,
+      adId: ad.adId,
+      requestId: ad.requestId,
+      uri: ad.uri,
+      slot: ad.slot,
+      mediaType: ad.mediaType,
+      isPodcastAd: ad.isPodcastAd,
+      isDsaEligible: ad.isDsaEligible,
+      clickthroughUrl: ad.clickthroughUrl,
+      advertiser: ad.advertiser || metadata.advertiser,
+      creativeId: metadata.creative_id,
+      lineitemId: metadata.lineitem_id,
+      buttonMessage: metadata.buttonMessage,
+      tagline: metadata.tagline,
+      logoImage: metadata.logoImage || ad.logoImage,
+      images: compactValue(ad.images),
+      metadata: compactValue(metadata),
+    };
+    if (!summary.id && !summary.adId && !summary.uri && !summary.clickthroughUrl && !summary.advertiser) {
+      return null;
+    }
+    return summary;
+  }
+
+  function rememberInStreamAd(ad, reason) {
+    try {
+      const summary = summarizeAdObject(ad);
+      if (!summary) return;
+      suppressAdUi(reason || "instream-ad", 3000);
+      const key = [
+        summary.adId || summary.id || "",
+        summary.requestId || "",
+        summary.uri || "",
+        summary.clickthroughUrl || "",
+      ].join("|");
+      window.__interceptify_seen_instream_ads = window.__interceptify_seen_instream_ads || new Set();
+      if (key && window.__interceptify_seen_instream_ads.has(key)) return;
+      if (key) window.__interceptify_seen_instream_ads.add(key);
+      rememberIntel("instreamAds", { reason, ad: summary });
+      snifferLog("instream-ad", {
+        reason,
+        id: summary.adId || summary.id,
+        advertiser: summary.advertiser,
+        uri: summary.uri,
+        clickthroughUrl: (summary.clickthroughUrl || "").slice(0, 220),
+      });
+      window.__interceptify_instream_ad_until = Date.now() + 3000;
+      try {
+        window.__interceptify_ad_active = true;
+        setBadgeState("ad");
+        muteAllAudio(true);
+        applyAdActiveGains(true);
+      } catch {}
+    } catch {}
+  }
+
+  function inStreamAdKey(ad) {
+    try {
+      const summary = summarizeAdObject(ad);
+      if (!summary) return "";
+      return [
+        summary.adId || summary.id || "",
+        summary.requestId || "",
+        summary.uri || "",
+        summary.clickthroughUrl || "",
+      ].join("|");
+    } catch {}
+    return "";
+  }
+
+  function rememberInStreamApiCall(method, info) {
+    if (!DEBUG_CAPTURE) return;
+    try {
+      rememberIntel("instreamApiCalls", {
+        method,
+        ...compactValue(info || {}, 0),
+      });
+      snifferLog("instream-api-call", {
+        method,
+        hasAd: !!(info && info.ad),
+        argCount: info && info.argCount,
+      });
+    } catch {}
+  }
+
+  function inStreamAdFromMessage(value) {
+    if (!value || typeof value !== "object") return null;
+    return value.ad || value.inStreamAd || value.instreamAd || null;
+  }
+
+  function looksLikeInStreamAdMessage(value) {
+    try {
+      const ad = inStreamAdFromMessage(value);
+      if (summarizeAdObject(ad)) return true;
+      const selfSummary = summarizeAdObject(value);
+      if (selfSummary && (selfSummary.creativeId || selfSummary.lineitemId || selfSummary.advertiser)) return true;
+      const preview = JSON.stringify(compactValue(value, 0));
+      return /Spotify Ad Server|audio_ad|creative_id|lineitem_id/.test(preview) &&
+        /advertiser|requestId|adId|inStream/i.test(preview);
+    } catch {}
+    return false;
+  }
+
+  function maybeRememberInStreamMessage(method, value) {
+    try {
+      const msg = value && typeof value === "object" ? value : null;
+      const ad = inStreamAdFromMessage(msg);
+      if (ad) {
+        rememberInStreamAd(ad, method);
+        rememberInStreamApiCall(method, { ad: summarizeAdObject(ad), message: compactValue(msg, 0) });
+        return true;
+      }
+      if (summarizeAdObject(msg)) {
+        rememberInStreamAd(msg, method);
+        rememberInStreamApiCall(method, { ad: summarizeAdObject(msg), message: compactValue(msg, 0) });
+        return true;
+      }
+      if (msg && /ad/i.test(JSON.stringify(compactValue(msg, 0)))) {
+        rememberInStreamApiCall(method, { message: compactValue(msg, 0) });
+      }
+    } catch {}
+    return false;
+  }
+
+  function neutralizeInStreamAd(api, ad, reason) {
+    const summary = summarizeAdObject(ad);
+    if (!summary) return false;
+    suppressAdUi(reason || "neutralize", 3000);
+    rememberInStreamAd(ad, reason);
+    rememberInStreamApiCall(`${reason}.neutralize`, { ad: summary });
+    if (!blockInStreamSignal()) return false;
+    try {
+      const key = inStreamAdKey(ad) || `${Date.now()}`;
+      window.__interceptify_neutralized_ads = window.__interceptify_neutralized_ads || new Set();
+      if (!window.__interceptify_neutralized_ads.has(key)) {
+        window.__interceptify_neutralized_ads.add(key);
+        if (api && typeof api.skipToNext === "function") {
+          try {
+            rememberInStreamApiCall("skipToNext.forAd", { ad: summary });
+            api.skipToNext();
+          } catch (e) {
+            rememberInStreamApiCall("skipToNext.error", { error: String(e && e.message || e) });
+          }
+        }
+      }
+      if (api && api.__interceptify_set_instream_ad) {
+        api.__interceptify_set_instream_ad(null);
+      } else if (api && Object.prototype.hasOwnProperty.call(api, "inStreamAd")) {
+        api.inStreamAd = null;
+      }
+    } catch {}
+    return true;
+  }
+
+  function wrapInStreamCallback(callback, reason) {
+    if (typeof callback !== "function") return callback;
+    if (callback.__interceptify_wrapped) return callback;
+    window.__interceptify_callback_wrappers = window.__interceptify_callback_wrappers || new WeakMap();
+    const existing = window.__interceptify_callback_wrappers.get(callback);
+    if (existing) return existing;
+    const wrapped = function () {
+      const args = Array.from(arguments);
+      const hasAdPayload = args.some((value) => maybeRememberInStreamMessage(`${reason}.callback`, value));
+      rememberInStreamApiCall(`${reason}.callback`, {
+        argCount: args.length,
+        args: compactValue(args, 0),
+      });
+      if (hasAdPayload && blockInStreamSignal()) {
+        rememberInStreamApiCall(`${reason}.callback.blocked`, {
+          argCount: args.length,
+          args: compactValue(args, 0),
+        });
+        return undefined;
+      }
+      return callback.apply(this, arguments);
+    };
+    wrapped.__interceptify_wrapped = true;
+    wrapped.__interceptify_original = callback;
+    window.__interceptify_callback_wrappers.set(callback, wrapped);
+    return wrapped;
+  }
+
+  function wrapCallbackCollection(collection, reason) {
+    if (!collection || collection.__interceptify_callbacks_wrapped) return collection;
+    try {
+      if (collection instanceof Set) {
+        const values = Array.from(collection);
+        collection.clear();
+        values.forEach((value) => collection.add(wrapInStreamCallback(value, reason)));
+        const originalAdd = collection.add;
+        collection.add = function (value) {
+          rememberInStreamApiCall(`${reason}.add`, { valueType: typeof value });
+          return originalAdd.call(this, wrapInStreamCallback(value, reason));
+        };
+        collection.__interceptify_callbacks_wrapped = true;
+        rememberInStreamApiCall(`${reason}.wrapped-set`, { size: collection.size });
+        return collection;
+      }
+      if (Array.isArray(collection)) {
+        for (let i = 0; i < collection.length; i++) {
+          collection[i] = wrapInStreamCallback(collection[i], reason);
+        }
+        ["push", "unshift"].forEach((method) => {
+          const original = collection[method];
+          collection[method] = function () {
+            const values = Array.from(arguments).map((value) => wrapInStreamCallback(value, reason));
+            rememberInStreamApiCall(`${reason}.${method}`, { count: values.length });
+            return original.apply(this, values);
+          };
+        });
+        const originalSplice = collection.splice;
+        collection.splice = function (start, deleteCount) {
+          const rest = Array.prototype.slice.call(arguments, 2).map((value) => wrapInStreamCallback(value, reason));
+          rememberInStreamApiCall(`${reason}.splice`, { count: rest.length });
+          return originalSplice.apply(this, [start, deleteCount, ...rest]);
+        };
+        collection.__interceptify_callbacks_wrapped = true;
+        rememberInStreamApiCall(`${reason}.wrapped-array`, { length: collection.length });
+        return collection;
+      }
+      if (typeof collection === "function") {
+        return wrapInStreamCallback(collection, reason);
+      }
+      rememberInStreamApiCall(`${reason}.unknown-collection`, {
+        type: typeof collection,
+        keys: Object.keys(collection || {}).slice(0, 30),
+      });
+    } catch (e) {
+      rememberInStreamApiCall(`${reason}.wrap-error`, { error: String(e && e.message || e) });
+    }
+    return collection;
+  }
+
+  function wrapAdMessageCallbackSlot(api, reason) {
+    if (!api || api.__interceptify_callback_slot_wrapped) return;
+    try {
+      const existing = api.onAdMessageCallbacks;
+      let currentCallbacks = wrapCallbackCollection(existing, `${reason}.onAdMessageCallbacks`);
+      Object.defineProperty(api, "onAdMessageCallbacks", {
+        configurable: true,
+        enumerable: true,
+        get() {
+          return currentCallbacks;
+        },
+        set(value) {
+          currentCallbacks = wrapCallbackCollection(value, `${reason}.onAdMessageCallbacks`);
+        },
+      });
+      api.__interceptify_callback_slot_wrapped = true;
+    } catch (e) {
+      rememberInStreamApiCall("onAdMessageCallbacks.wrap-error", { reason, error: String(e && e.message || e) });
+    }
+  }
+
+  function wrapInStreamApi(api, reason) {
+    if (!api || typeof api !== "object" || api.__interceptify_api_wrapped) return api;
+    try {
+      window.__interceptify_instream_api = api;
+      wrapAdMessageCallbackSlot(api, reason);
+      try {
+        const existing = api.inStreamAd;
+        let currentInStreamAd = existing && summarizeAdObject(existing) && blockInStreamSignal() ? null : existing;
+        api.__interceptify_set_instream_ad = (value) => { currentInStreamAd = value; };
+        Object.defineProperty(api, "inStreamAd", {
+          configurable: true,
+          enumerable: true,
+          get() {
+            const hasAd = summarizeAdObject(currentInStreamAd);
+            if (hasAd && blockInStreamSignal()) {
+              neutralizeInStreamAd(api, currentInStreamAd, "inStreamAd.get");
+              return null;
+            }
+            return currentInStreamAd;
+          },
+          set(value) {
+            if (summarizeAdObject(value)) {
+              rememberInStreamApiCall("inStreamAd.set", { ad: summarizeAdObject(value) });
+              if (blockInStreamSignal()) {
+                neutralizeInStreamAd(api, value, "inStreamAd.set");
+                currentInStreamAd = null;
+                return;
+              }
+            }
+            currentInStreamAd = value;
+          },
+        });
+        if (summarizeAdObject(existing)) neutralizeInStreamAd(api, existing, "inStreamAd.initial");
+      } catch (e) {
+        rememberInStreamApiCall("inStreamAd.wrap-error", { error: String(e && e.message || e) });
+      }
+      const names = new Set();
+      let cur = api;
+      while (cur && cur !== Object.prototype) {
+        Object.getOwnPropertyNames(cur).forEach((name) => names.add(name));
+        cur = Object.getPrototypeOf(cur);
+      }
+      rememberInStreamApiCall("api-discovered", {
+        reason,
+        methods: Array.from(names).filter((name) => typeof api[name] === "function").sort(),
+        keys: Object.keys(api || {}).sort(),
+      });
+      names.forEach((name) => {
+        if (name === "constructor" || typeof api[name] !== "function") return;
+        if (api[name].__interceptify_wrapped) return;
+        const original = api[name];
+        api[name] = function () {
+          const args = Array.from(arguments);
+          const wrappedArgs = args.map((arg, index) => {
+            if (typeof arg !== "function") return arg;
+            rememberInStreamApiCall(`${name}.callback-wrapped`, { index });
+            return wrapInStreamCallback(arg, name);
+          });
+          rememberInStreamApiCall(name, {
+            argCount: args.length,
+            args: compactValue(args, 0),
+          });
+          const hasAdPayload = args.some((value) => {
+            const remembered = maybeRememberInStreamMessage(`${name}.arg`, value);
+            return remembered || looksLikeInStreamAdMessage(value);
+          });
+          if (hasAdPayload && blockInStreamSignal() && /processMessage|set|notify|emit|publish/i.test(name)) {
+            rememberInStreamApiCall(`${name}.blocked`, {
+              argCount: args.length,
+              args: compactValue(args, 0),
+            });
+            return undefined;
+          }
+          const result = original.apply(this, wrappedArgs);
+          maybeRememberInStreamMessage(`${name}.return`, result);
+          if (result && typeof result.then === "function") {
+            result.then((value) => maybeRememberInStreamMessage(`${name}.promise`, value)).catch(() => {});
+          }
+          if (name === "getInStreamAd" && summarizeAdObject(result) && blockInStreamSignal()) {
+            neutralizeInStreamAd(api, result, "getInStreamAd.return");
+            return null;
+          }
+          return result;
+        };
+        api[name].__interceptify_wrapped = true;
+        api[name].__interceptify_original = original;
+      });
+      api.__interceptify_api_wrapped = true;
+    } catch (e) {
+      rememberInStreamApiCall("api-wrap-error", { reason, error: String(e && e.message || e) });
+    }
+    return api;
+  }
+
+  function wrapInStreamExports(exportsObj) {
+    if (!exportsObj || exportsObj.__interceptify_instream_hooked) return;
+    try {
+      if (typeof exportsObj.m === "function" && !exportsObj.m.__interceptify_wrapped) {
+        const orig = exportsObj.m;
+        const wrapped = function () {
+          const ad = orig.apply(this, arguments);
+          rememberInStreamAd(ad, "webpack-46849.m");
+          return ad;
+        };
+        wrapped.__interceptify_wrapped = true;
+        exportsObj.m = wrapped;
+      }
+      if (typeof exportsObj.d === "function" && !exportsObj.d.__interceptify_wrapped) {
+        const orig = exportsObj.d;
+        const wrapped = function () {
+          const api = wrapInStreamApi(orig.apply(this, arguments), "webpack-46849.d");
+          try {
+            if (api && typeof api.getInStreamAd === "function" && !api.getInStreamAd.__interceptify_wrapped) {
+              const origGet = api.getInStreamAd;
+              api.getInStreamAd = function () {
+                const ad = origGet.apply(this, arguments);
+                rememberInStreamAd(ad, "webpack-46849.d.getInStreamAd");
+                return ad;
+              };
+              api.getInStreamAd.__interceptify_wrapped = true;
+            }
+          } catch {}
+          return api;
+        };
+        wrapped.__interceptify_wrapped = true;
+        exportsObj.d = wrapped;
+      }
+      exportsObj.__interceptify_instream_hooked = true;
+    } catch {}
+  }
+
+  function installWebpackAdProviderHook() {
+    if (window.__interceptify_webpack_ad_hooked) return;
+    window.__interceptify_webpack_ad_hooked = true;
+    try {
+      const chunk = window.webpackChunkclient_web = window.webpackChunkclient_web || [];
+      const makeWrappedFactory = (originalFactory) => {
+        const wrappedFactory = function (module, exports, require) {
+          try {
+            const source = String(originalFactory);
+            if (source.includes("getInStreamAd") && source.includes("inStreamApi") && require.d) {
+              const playerState = require(5563);
+              const getApi = () => (0, playerState.G)().inStreamApi;
+              const wrappedD = () => {
+                const api = wrapInStreamApi(getApi(), "webpack-46849.replaced.d");
+                try {
+                  if (api && typeof api.getInStreamAd === "function" && !api.getInStreamAd.__interceptify_wrapped) {
+                    const origGet = api.getInStreamAd;
+                    api.getInStreamAd = function () {
+                      const ad = origGet.apply(this, arguments);
+                      rememberInStreamAd(ad, "webpack-46849.replaced.getInStreamAd");
+                      return ad;
+                    };
+                    api.getInStreamAd.__interceptify_wrapped = true;
+                  }
+                } catch {}
+                return api;
+              };
+              const wrappedM = () => {
+                const ad = wrappedD().getInStreamAd();
+                rememberInStreamAd(ad, "webpack-46849.replaced.m");
+                return ad;
+              };
+              require.d(exports, { d: () => wrappedD, m: () => wrappedM });
+              snifferLog("webpack-module-replaced", { module: "46849" });
+              return undefined;
+            }
+          } catch {}
+          const result = originalFactory.apply(this, arguments);
+          try { wrapInStreamExports(module && module.exports || exports); } catch {}
+          return result;
+        };
+        wrappedFactory.__interceptify_wrapped = true;
+        return wrappedFactory;
+      };
+      const patchModules = (modules) => {
+        try {
+          const key = modules && (modules[46849] ? 46849 : (modules["46849"] ? "46849" : null));
+          if (key == null || modules[key].__interceptify_wrapped) return;
+          modules[key] = makeWrappedFactory(modules[key]);
+          snifferLog("webpack-module-hooked", { module: "46849" });
+        } catch {}
+      };
+      const patchRequire = (require) => {
+        try {
+          if (require && require.m && require.m[46849] && !require.m[46849].__interceptify_wrapped) {
+            require.m[46849] = makeWrappedFactory(require.m[46849]);
+            if (require.c && require.c[46849]) delete require.c[46849];
+            snifferLog("webpack-runtime-module-hooked", { module: "46849" });
+          }
+        } catch {}
+      };
+      chunk.forEach((payload) => patchModules(payload && payload[1]));
+      const originalPush = chunk.push.bind(chunk);
+      chunk.push = function () {
+        for (let i = 0; i < arguments.length; i++) {
+          patchModules(arguments[i] && arguments[i][1]);
+        }
+        return originalPush.apply(this, arguments);
+      };
+      originalPush([[`interceptify-${Date.now()}`], {}, function (require) {
+        try {
+          window.__interceptify_webpack_require = require;
+          patchRequire(require);
+          wrapInStreamExports(require(46849));
+        } catch {}
+      }]);
+    } catch {}
+  }
+
+  installWebpackAdProviderHook();
 
   // ---- fetch hook (sniffer + ad-CDN blocker + metadata capture) ----
   if (window.fetch && !window.fetch.__interceptify_hooked) {
@@ -75,6 +677,12 @@
         const segMatch = url.match(/\/sources\/([a-f0-9]+)\//);
         if (segMatch && window.__interceptify_known_ad_sources &&
             window.__interceptify_known_ad_sources.has(segMatch[1])) {
+          rememberIntel("blockedSegments", {
+            srcId: segMatch[1],
+            url: url.slice(0, 220),
+            reason: "known-ad-source",
+          });
+          snifferLog("segment-blocked", { srcId: segMatch[1], url: url.slice(0, 220) });
           return Promise.resolve(new Response(new ArrayBuffer(0), {
             status: 404, statusText: "Blocked by Interceptify (known ad source)",
           }));
@@ -92,29 +700,54 @@
         const mfMatch = url.match(/\/manifests\/v\d+\/json\/sources\/([a-f0-9]+)\/options/);
         if (mfMatch) {
           const srcId = mfMatch[1];
-          window.__interceptify_known_ad_sources = window.__interceptify_known_ad_sources || new Set();
           // If we've already classified this srcId as ad, return empty immediately
           if (window.__interceptify_known_ad_sources.has(srcId)) {
-            return Promise.resolve(new Response(
-              JSON.stringify({ contents: [] }),
-              { status: 200, headers: { "Content-Type": "application/json" } }
-            ));
+            rememberIntel("blockedSources", {
+              srcId,
+              url: url.slice(0, 220),
+              reason: "cached-known-ad-source",
+            });
+            return Promise.resolve(emptyManifestResponse());
           }
           // Otherwise fetch normally, then inspect & maybe rewrite
           return _f.apply(this, arguments).then(async (resp) => {
             try {
               const text = await resp.clone().text();
-              const endMatches = text.match(/"end_time_millis"\s*:\s*(\d+)/g) || [];
-              const maxEnd = endMatches
-                .map((s) => parseInt(s.match(/(\d+)/)[1], 10))
-                .reduce((a, b) => Math.max(a, b), 0);
+              const maxEnd = extractManifestMaxEnd(text);
+              if (DEBUG_CAPTURE) {
+                rememberIntel("manifests", {
+                  srcId,
+                  url: url.slice(0, 220),
+                  status: resp.status,
+                  maxEnd,
+                  classifiedAs: maxEnd > 0 && maxEnd < 60000 ? "ad" : "content",
+                  bodyLen: text.length,
+                  body: text.slice(0, 3000),
+                });
+                window.__interceptify_meta_log.push({
+                  ts: Date.now(),
+                  adActive: !!window.__interceptify_ad_active,
+                  url: url.slice(0, 220),
+                  status: resp.status,
+                  bodyLen: text.length,
+                  body: text.slice(0, 4000),
+                  srcId,
+                  maxEnd,
+                });
+                if (window.__interceptify_meta_log.length > 80)
+                  window.__interceptify_meta_log = window.__interceptify_meta_log.slice(-50);
+              }
               if (maxEnd > 0 && maxEnd < 60000) {
                 window.__interceptify_known_ad_sources.add(srcId);
+                rememberIntel("blockedSources", {
+                  srcId,
+                  url: url.slice(0, 220),
+                  maxEnd,
+                  reason: "manifest-duration-under-60s",
+                });
+                snifferLog("manifest-blocked", { srcId, maxEnd, url: url.slice(0, 220) });
                 console.log("[interceptify] ad manifest blocked: srcId=" + srcId.slice(0, 8) + "... duration=" + (maxEnd / 1000).toFixed(1) + "s");
-                return new Response(
-                  JSON.stringify({ contents: [] }),
-                  { status: 200, headers: { "Content-Type": "application/json" } }
-                );
+                return emptyManifestResponse();
               }
             } catch {}
             return resp;
@@ -122,14 +755,18 @@
         }
       } catch {}
 
-      // While ad-active, additional belt-and-braces ad-CDN block.
+      // Observe ad-active CDN segments, but do not block by adActive alone.
+      // The same hosts/URL shape carry real music and podcasts; only a
+      // classified srcId is safe enough to block.
       try {
         if (window.__interceptify_ad_active &&
             /\/segments\/v\d+\/origins\/[a-f0-9]+\/sources\/[a-f0-9]+\//.test(url) &&
             /spotifycdn\.com/.test(url)) {
-          return Promise.resolve(new Response(new ArrayBuffer(0), {
-            status: 404, statusText: "Blocked by Interceptify (ad-active CDN)",
-          }));
+          const m = url.match(/\/sources\/([a-f0-9]+)\//);
+          snifferLog("segment-ad-active-observed", {
+            srcId: m && m[1],
+            url: url.slice(0, 220),
+          });
         }
       } catch {}
 
@@ -141,7 +778,7 @@
         /\/manifests\/v\d+\/json\/sources\//.test(url);
 
       const promise = _f.apply(this, arguments);
-      if (interesting) {
+      if (DEBUG_CAPTURE && interesting) {
         promise.then(async (resp) => {
           try {
             const text = await resp.clone().text();
@@ -164,7 +801,7 @@
   }
 
   // ---- XMLHttpRequest sniffer ----
-  if (XMLHttpRequest && !XMLHttpRequest.prototype.__interceptify_hooked) {
+  if (DEBUG_CAPTURE && XMLHttpRequest && !XMLHttpRequest.prototype.__interceptify_hooked) {
     const _o = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (method, url) {
       try { snifferLog("xhr-open", { method, url: (url || "").slice(0, 220) }); } catch {}
@@ -174,7 +811,7 @@
   }
 
   // ---- WebSocket constructor wrap (catch the dealer) ----
-  if (window.WebSocket && !window.WebSocket.__interceptify_hooked) {
+  if (DEBUG_CAPTURE && window.WebSocket && !window.WebSocket.__interceptify_hooked) {
     const _WS = window.WebSocket;
     const Wrapped = function (url, protocols) {
       try { snifferLog("ws-open", { url: (url || "").slice(0, 220) }); } catch {}
@@ -206,7 +843,7 @@
   }
 
   // ---- navigator.sendBeacon (telemetry) ----
-  if (navigator.sendBeacon && !navigator.sendBeacon.__interceptify_hooked) {
+  if (DEBUG_CAPTURE && navigator.sendBeacon && !navigator.sendBeacon.__interceptify_hooked) {
     const _sb = navigator.sendBeacon.bind(navigator);
     navigator.sendBeacon = function (url, data) {
       try { snifferLog("beacon", { url: (url || "").slice(0, 220) }); } catch {}
@@ -216,7 +853,7 @@
   }
 
   // ---- EventSource (Server-Sent Events) ----
-  if (window.EventSource && !window.EventSource.__interceptify_hooked) {
+  if (DEBUG_CAPTURE && window.EventSource && !window.EventSource.__interceptify_hooked) {
     const _ES = window.EventSource;
     const WrappedES = function (url, opts) {
       try { snifferLog("eventsource-open", { url: (url || "").slice(0, 220) }); } catch {}
@@ -235,7 +872,7 @@
   }
 
   // ---- BroadcastChannel (cross-renderer messaging) ----
-  if (window.BroadcastChannel && !window.BroadcastChannel.__interceptify_hooked) {
+  if (DEBUG_CAPTURE && window.BroadcastChannel && !window.BroadcastChannel.__interceptify_hooked) {
     const _BC = window.BroadcastChannel;
     const WrappedBC = function (name) {
       const bc = new _BC(name);
@@ -256,7 +893,7 @@
   }
 
   // ---- MediaSource tracking + sourcebuffer instrumentation ----
-  if (window.MediaSource && !MediaSource.prototype.__interceptify_hooked) {
+  if (DEBUG_CAPTURE && window.MediaSource && !MediaSource.prototype.__interceptify_hooked) {
     const _add = MediaSource.prototype.addSourceBuffer;
     MediaSource.prototype.__interceptify_hooked = true;
     MediaSource.prototype.addSourceBuffer = function (mime) {
@@ -265,12 +902,10 @@
       const sb = _add.apply(this, arguments);
       const _ap = sb.appendBuffer.bind(sb);
       sb.appendBuffer = function (data) {
-        // While ad-active, refuse to append further audio chunks to any
-        // existing MediaSource. The buffer will starve and Spotify's
-        // player will signal end-of-stream → advances.
+        // Instrument only. Dropping MediaSource buffers can poison the next
+        // real track when Spotify leaves ad UI mounted after ad audio ends.
         if (window.__interceptify_ad_active) {
-          try { snifferLog("ms-appendBuffer-BLOCKED", { size: data.byteLength || 0, mime }); } catch {}
-          return; // silently drop
+          try { snifferLog("ms-appendBuffer-ad-active", { size: data.byteLength || 0, mime }); } catch {}
         }
         try { snifferLog("ms-appendBuffer", { size: data.byteLength || data.size || 0, mime }); } catch {}
         return _ap(data);
@@ -280,7 +915,7 @@
   }
 
   // URL.createObjectURL: tag MediaSource with its blob URL so we can correlate
-  if (URL.createObjectURL && !URL.createObjectURL.__interceptify_hooked) {
+  if (DEBUG_CAPTURE && URL.createObjectURL && !URL.createObjectURL.__interceptify_hooked) {
     const _c = URL.createObjectURL.bind(URL);
     URL.createObjectURL = function (obj) {
       const u = _c(obj);
@@ -306,7 +941,7 @@
     );
     const fromOurScript = () => {
       const s = (new Error()).stack || "";
-      return /interceptify-adblock|nuclearSkip|spamSeekForward|killVideoAd|forcePlayDuringAd|clickNextTrack|killCurrentMediaSources/.test(s);
+      return /interceptify-adblock|nuclearSkip|spamSeekForward|killVideoAd|clickNextTrack|killCurrentMediaSources/.test(s);
     };
     const _click = HTMLElement.prototype.click;
     HTMLElement.prototype.click = function () {
@@ -344,7 +979,7 @@
   // ---- Sniffer buffer expanded for 1-hour data collection ----
   // Bigger ring buffer + periodic snapshot to sessionStorage so we don't
   // lose data on tab refresh.
-  setInterval(() => {
+  if (DEBUG_CAPTURE) setInterval(() => {
     try {
       const events = window.__interceptify_sniffer || [];
       if (events.length > 30000) {
@@ -357,6 +992,13 @@
         adActiveCount: events.filter(e => e.adActive).length,
         metaLogCount: (window.__interceptify_meta_log || []).length,
         detections: window.__interceptify ? window.__interceptify.stats() : null,
+        knownAdSources: window.__interceptify_known_ad_sources ? window.__interceptify_known_ad_sources.size : 0,
+        adIntel: {
+          manifests: (window.__interceptify_ad_intel && window.__interceptify_ad_intel.manifests || []).length,
+          blockedSources: (window.__interceptify_ad_intel && window.__interceptify_ad_intel.blockedSources || []).length,
+          blockedSegments: (window.__interceptify_ad_intel && window.__interceptify_ad_intel.blockedSegments || []).length,
+          adPlays: (window.__interceptify_ad_intel && window.__interceptify_ad_intel.adPlays || []).length,
+        },
       }));
     } catch {}
   }, 30000);
@@ -364,7 +1006,7 @@
   // ---- PerformanceObserver: catches EVERY network resource ----
   // Belt-and-braces in case some fetch path bypasses our hooks.
   try {
-    if (typeof PerformanceObserver !== "undefined" && !window.__interceptify_perfobs) {
+    if (DEBUG_CAPTURE && typeof PerformanceObserver !== "undefined" && !window.__interceptify_perfobs) {
       window.__interceptify_perfobs = true;
       const po = new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) {
@@ -384,7 +1026,7 @@
 
   // ---- Service Worker registration tracker ----
   try {
-    if (navigator.serviceWorker && !navigator.serviceWorker.__interceptify_hooked) {
+    if (DEBUG_CAPTURE && navigator.serviceWorker && !navigator.serviceWorker.__interceptify_hooked) {
       const _reg = navigator.serviceWorker.register.bind(navigator.serviceWorker);
       navigator.serviceWorker.register = function (url, opts) {
         try { snifferLog("sw-register", { url: (url || "").slice(0, 220), opts: JSON.stringify(opts || {}) }); } catch {}
@@ -396,7 +1038,7 @@
 
   // ---- Worker constructor hook ----
   try {
-    if (window.Worker && !window.Worker.__interceptify_hooked) {
+    if (DEBUG_CAPTURE && window.Worker && !window.Worker.__interceptify_hooked) {
       const _W = window.Worker;
       const Wrapped = function (url, opts) {
         try { snifferLog("worker-create", { url: (typeof url === "string" ? url : "<blob>").slice(0, 220) }); } catch {}
@@ -410,24 +1052,26 @@
 
   // ---- localStorage / sessionStorage tracking for ad-related keys ----
   try {
-    const trackStorage = (storage, label) => {
-      const _set = storage.setItem.bind(storage);
-      storage.setItem = function (k, v) {
-        try {
-          if (/ad|ads|sponsor|promot/i.test(k) && k !== "__interceptify_summary") {
-            snifferLog(label + "-setItem", { key: k, valLen: (v || "").length, val: (v || "").slice(0, 200) });
-          }
-        } catch {}
-        return _set(k, v);
+    if (DEBUG_CAPTURE) {
+      const trackStorage = (storage, label) => {
+        const _set = storage.setItem.bind(storage);
+        storage.setItem = function (k, v) {
+          try {
+            if (/ad|ads|sponsor|promot/i.test(k) && k !== "__interceptify_summary") {
+              snifferLog(label + "-setItem", { key: k, valLen: (v || "").length, val: (v || "").slice(0, 200) });
+            }
+          } catch {}
+          return _set(k, v);
+        };
       };
-    };
-    if (!localStorage.__interceptify_hooked) {
-      trackStorage(localStorage, "localStorage");
-      Object.defineProperty(localStorage, "__interceptify_hooked", { value: true });
-    }
-    if (!sessionStorage.__interceptify_hooked) {
-      trackStorage(sessionStorage, "sessionStorage");
-      Object.defineProperty(sessionStorage, "__interceptify_hooked", { value: true });
+      if (!localStorage.__interceptify_hooked) {
+        trackStorage(localStorage, "localStorage");
+        Object.defineProperty(localStorage, "__interceptify_hooked", { value: true });
+      }
+      if (!sessionStorage.__interceptify_hooked) {
+        trackStorage(sessionStorage, "sessionStorage");
+        Object.defineProperty(sessionStorage, "__interceptify_hooked", { value: true });
+      }
     }
   } catch {}
 
@@ -438,7 +1082,7 @@
 
   // ---- MutationObserver on <body> to record EXACT ad UI mount time ----
   try {
-    if (!window.__interceptify_mo_installed) {
+    if (DEBUG_CAPTURE && !window.__interceptify_mo_installed) {
       window.__interceptify_mo_installed = true;
       const startup = () => {
         if (!document.body) return setTimeout(startup, 100);
@@ -560,9 +1204,7 @@
     '[data-testid="context-item-info-ad-title"]',
     '[data-testid="context-item-info-ad-subtitle"]',
     '[data-testid="ad-controls"]',
-    '[data-testid="ad-companion-card"]',
     '[data-testid="ad-countdown-timer"]',
-    '[data-testid="leavebehind-advertiser"]',
     // Video / canvas ads
     '[data-testid="ads-video-player-npv"]',
     '[data-testid="standalone-video-ad-player"]',
@@ -576,6 +1218,11 @@
   // Visual-only ad surfaces — we hide them via CSS rather than skip/mute.
   // Includes everything that's a banner / carousel / promotion shelf.
   const VISUAL_AD_SELECTORS = [
+    '[data-testid="context-item-info-ad-title"]',
+    '[data-testid="context-item-info-ad-subtitle"]',
+    '[data-testid="context-item-info"][aria-label*="Advertisement" i]',
+    '[data-testid="ad-controls"]',
+    '[data-testid="ad-countdown-timer"]',
     '[data-testid="embedded-ad"]',
     '[data-testid="embedded-ad-carousel"]',
     '[data-testid="home-ad-card"]',
@@ -717,20 +1364,34 @@
   let eventBasedAd = false;
   const AD_START_EVENTS = /^(adrequest|adresponse|adbreakstart|adplay|adplaying|adfirstquartile|admidpoint)$/i;
   const AD_END_EVENTS = /^(adended|adbreakend|aderror)$/i;
+  function markAdEvent(eventName) {
+    try {
+      if (!eventName || typeof eventName !== "string") return;
+      if (AD_START_EVENTS.test(eventName)) {
+        eventBasedAd = true;
+        log("event-emitter ad signal:", eventName);
+      } else if (AD_END_EVENTS.test(eventName)) {
+        eventBasedAd = false;
+      }
+    } catch {}
+  }
   function tryHookEmitter(proto, methodName) {
     if (!proto || typeof proto[methodName] !== "function" || proto["__interceptify_" + methodName]) return;
     const orig = proto[methodName];
     proto["__interceptify_" + methodName] = true;
     proto[methodName] = function (eventName, handler, ...rest) {
       try {
-        if (typeof eventName === "string") {
-          if (AD_START_EVENTS.test(eventName)) {
-            eventBasedAd = true;
-            log("event-emitter ad signal:", eventName);
-          } else if (AD_END_EVENTS.test(eventName)) {
-            eventBasedAd = false;
-          }
+        const name = typeof eventName === "string" ? eventName : (eventName && eventName.type);
+        if ((methodName === "on" || methodName === "addEventListener") &&
+            typeof eventName === "string" && typeof handler === "function" &&
+            (AD_START_EVENTS.test(eventName) || AD_END_EVENTS.test(eventName))) {
+          const wrapped = function (...args) {
+            markAdEvent(eventName);
+            return handler.apply(this, args);
+          };
+          return orig.call(this, eventName, wrapped, ...rest);
         }
+        markAdEvent(name);
       } catch {}
       return orig.call(this, eventName, handler, ...rest);
     };
@@ -740,6 +1401,7 @@
   setInterval(() => {
     try {
       tryHookEmitter(EventTarget && EventTarget.prototype, "dispatchEvent");
+      tryHookEmitter(EventTarget && EventTarget.prototype, "addEventListener");
       // Walk a small set of globals looking for emitter-like objects
       for (const k of Object.keys(window)) {
         const v = window[k];
@@ -762,10 +1424,17 @@
     // 3) Strong: any element whose class or text declares Advertisement
     const all = document.querySelectorAll("[class*='Advertisement'], [class*='advertisement']");
     if (all.length) return "class:Advertisement";
-    // 4) Now-playing title says Advertisement
+    // 4) Spotify's own in-stream ad provider returned an ad object before
+    //    React painted the ad controls. Use it as a short bridge signal;
+    //    once the DOM mounts, selector detection above takes over.
+    if (window.__interceptify_instream_ad_until &&
+        Date.now() < window.__interceptify_instream_ad_until) {
+      return "instream-ad-object";
+    }
+    // 5) Now-playing title says Advertisement
     const titleEl = document.querySelector('[data-testid="context-item-link"]');
     if (titleEl && /advert/i.test(titleEl.textContent || "")) return "title-text:advert";
-    // 5) <title> === "Spotify" with playing audio shorter than 60s -> very
+    // 6) <title> === "Spotify" with playing audio shorter than 60s -> very
     //    likely an ad. Music titles always include the track name.
     if (document.title.replace(/^●\s*/, "").trim() === "Spotify") {
       const a = document.querySelector("audio");
@@ -774,6 +1443,27 @@
       }
     }
     return null;
+  }
+
+  function captureAdPlay(reason) {
+    if (!DEBUG_CAPTURE) return;
+    try {
+      const testIds = [];
+      document.querySelectorAll("[data-testid]").forEach((e) => {
+        const id = e.getAttribute("data-testid");
+        if (id && /ad|promo|sponsor|advert/i.test(id)) testIds.push(id);
+      });
+      const recentNetwork = (window.__interceptify_sniffer || [])
+        .filter((e) => Date.now() - e.ts < 30000)
+        .filter((e) => /fetch|xhr-open|perf-resource|segment|manifest/.test(e.kind || ""))
+        .slice(-80);
+      rememberIntel("adPlays", {
+        reason,
+        testIds: Array.from(new Set(testIds)).slice(0, 80),
+        knownAdSources: Array.from(window.__interceptify_known_ad_sources || []),
+        recentNetwork,
+      });
+    } catch {}
   }
 
   function clickNextTrack() {
@@ -812,18 +1502,10 @@
     return true;
   }
 
-  // If Spotify is paused mid-ad, our seek-forward spam can't actually
-  // advance the playhead -- audio has to be playing. So when an ad is
-  // detected and the play/pause button shows the "play" affordance
-  // (i.e. currently paused), click play to start the ad audio. The mute
-  // is already on, so the user hears nothing.
+  // Respect user pause during ads. Earlier builds forced play so seek spam
+  // could drain the ad, but that made the pause button feel broken.
   function forcePlayDuringAd() {
-    const pp = document.querySelector('[data-testid="control-button-playpause"]');
-    if (!pp) return;
-    const aria = pp.getAttribute("aria-label") || "";
-    if (/^(play|spela)/i.test(aria)) {
-      try { pp.click(); } catch {}
-    }
+    return false;
   }
 
   // --- Nuclear skip: fire every tool we have on every ad tick. -------------
@@ -836,8 +1518,6 @@
     const buttonIds = [
       "control-button-skip-forward",
       "control-button-seek-forward-15",
-      "control-button-skip-back",
-      "control-button-seek-back-15",
     ];
     for (const id of buttonIds) {
       document.querySelectorAll('[data-testid="' + id + '"]').forEach((b) => {
@@ -849,8 +1529,7 @@
     if (fwd15) {
       for (let i = 0; i < 8; i++) { try { fwd15.click(); } catch {} }
     }
-    // 3. Force-play if paused (so seeks actually advance)
-    forcePlayDuringAd();
+    // 3. Do not force-play if paused. The user can pause during an ad.
     // 4. Set the progress slider value to its max via React-friendly setter
     document.querySelectorAll('[data-testid="playback-progressbar"] input[type="range"]').forEach((inp) => {
       try {
@@ -884,13 +1563,10 @@
       try { v.dispatchEvent(new Event("ended", { bubbles: true })); } catch {}
       try { v.pause(); } catch {}
     });
-    // 7. Force-mute every <audio> element (rare on this build but cheap)
+    // 7. Force-mute every <audio> element. Do not dispatch ended here:
+    // if ad detection lingers, that can kill the first real song after it.
     document.querySelectorAll("audio").forEach((a) => {
       try { a.muted = true; a.volume = 0; } catch {}
-      if (isFinite(a.duration) && a.duration > 0) {
-        try { a.currentTime = a.duration - 0.05; } catch {}
-      }
-      try { a.dispatchEvent(new Event("ended", { bubbles: true })); } catch {}
     });
     // 8. Fire keyboard shortcuts that Spotify maps to seek/next
     //    Right arrow = seek forward, Shift+Right = next track (Spotify Web)
@@ -986,6 +1662,7 @@
         stats.lastDetection = new Date().toISOString();
         stats.lastSelector = detected;
         log("ad detected via:", detected);
+        captureAdPlay(detected);
         setBadgeState("ad");
         muteAllAudio(true);
         // Flip the low-level switch -- mutes every existing AudioContext
@@ -997,12 +1674,11 @@
       // every detection tick. Don't differentiate by ad type, don't try
       // to be smart -- just throw all available tools at the problem.
       // No-ops are free.
-      nuclearSkip();
-      // Plus: surgical kill of the underlying media stream. The fetch
-      // hook above already returns 404 for new ad-CDN segments while
-      // ad-active; calling endOfStream() on the open MediaSource forces
-      // Spotify's player to fire its 'ended' handler and advance.
-      try { killCurrentMediaSources(); } catch {}
+      if (detected !== "instream-ad-object") {
+        nuclearSkip();
+      }
+      // Avoid endOfStream() here; Spotify can reuse the same MediaSource
+      // across the ad-to-song transition, which can stall the next track.
     } else if (!detected && wasAd) {
       log("ad ended");
       setBadgeState("idle");
@@ -1018,9 +1694,23 @@
   //   __interceptify.scanAds()      -> list any ad-shaped elements right now
   //   __interceptify.testIds()      -> all data-testid values currently in DOM
   window.__interceptify = {
-    version: "2026-04-29",
+    version: "2026-04-30",
+    debugCapture: DEBUG_CAPTURE,
     stats: () => ({ ...stats }),
     status() { console.table(stats); return stats; },
+    knownAdSources() {
+      return Array.from(window.__interceptify_known_ad_sources || []);
+    },
+    adIntel() {
+      return {
+        ...(window.__interceptify_ad_intel || {}),
+        knownAdSources: Array.from(window.__interceptify_known_ad_sources || []),
+      };
+    },
+    lastAdPlay() {
+      const plays = window.__interceptify_ad_intel && window.__interceptify_ad_intel.adPlays || [];
+      return plays[plays.length - 1] || null;
+    },
     scanAds() {
       const out = [];
       for (const s of STRONG_AD_SELECTORS.concat(VISUAL_AD_SELECTORS)) {
