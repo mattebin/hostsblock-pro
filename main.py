@@ -70,6 +70,10 @@ def app_root() -> Path:
     return Path(__file__).resolve().parent
 
 
+def is_frozen_build() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
 def bundled_root() -> Path:
     """Where PyInstaller-bundled data lives at runtime (sys._MEIPASS one-file)."""
     return Path(getattr(sys, "_MEIPASS", str(app_root())))
@@ -184,6 +188,7 @@ class InterceptifyApp:
         self.cfg = load_config()
         self.icon: Optional[pystray.Icon] = None
         self._latest_release: Optional[self_updater.Release] = None
+        self._update_in_progress = False
 
         # Optional personal feature: Spotify-update watcher + ntfy push.
         # Activates only if the local update_watcher.py is present.
@@ -314,87 +319,77 @@ class InterceptifyApp:
 
     # ---- Self-update -----------------------------------------------------
 
+    def _set_latest_release(self, rel: Optional["self_updater.Release"]) -> None:
+        if (self._latest_release and self._latest_release.tag) == (rel and rel.tag):
+            return
+        self._latest_release = rel
+        self.refresh_icon()
+
     def _poll_for_updates_loop(self) -> None:
         first = True
         while True:
             time.sleep(60 if first else 6 * 3600)
             first = False
             try:
+                if not is_frozen_build():
+                    self._set_latest_release(None)
+                    continue
                 rel = self_updater.get_latest_release()
                 if rel and self_updater.is_newer(rel.tag, APP_VERSION):
                     if self._latest_release is None or self._latest_release.tag != rel.tag:
                         log.info("Update available: %s (current %s)", rel.tag, APP_VERSION)
-                        self._latest_release = rel
-                        self.refresh_icon()
+                        self._set_latest_release(rel)
                         self.notify(
                             f"Update {rel.tag} available. Click 'Install update' in the tray menu.",
                         )
                 else:
-                    if self._latest_release is not None:
-                        self._latest_release = None
-                        self.refresh_icon()
+                    self._set_latest_release(None)
             except Exception as e:
                 log.warning("Update poll failed: %s", e)
 
     def install_update(self, *_args) -> None:
+        if self._update_in_progress:
+            self.notify("Update already in progress.")
+            return
         rel = self._latest_release
         if rel is None:
             self.notify("No update pending.")
             return
-        msg = (
-            f"Interceptify {rel.tag} is available.\n\n"
-            f"Current version: {APP_VERSION}\n"
-            f"Download size:   {rel.exe_asset_size // (1024*1024)} MB\n\n"
-            "The app will close, replace itself, and relaunch automatically.\n\n"
-            "Install now?"
-        )
-        try:
-            answer = ctypes.windll.user32.MessageBoxW(
-                None, msg, f"{APP_NAME} update", 0x4 | 0x20 | 0x40000
-            )
-        except Exception as e:
-            log.warning("MessageBox failed: %s", e)
-            answer = 6
-        if answer != 6:
+        if not self_updater.is_newer(rel.tag, APP_VERSION):
+            self._set_latest_release(None)
+            self.notify("Already on the latest Interceptify version.")
             return
-        threading.Thread(target=self._perform_update, args=(rel,), daemon=True).start()
-
-    def _perform_update(self, rel: "self_updater.Release") -> None:
-        if not getattr(sys, "frozen", False):
-            try:
-                ctypes.windll.user32.MessageBoxW(
-                    None,
-                    "You're running Interceptify from source.\n"
-                    f"Update with: git pull && pip install -r requirements.txt\n"
-                    f"\nLatest release: {rel.html_url}",
-                    f"{APP_NAME} update",
-                    0x40 | 0x40000,
-                )
-            except Exception:
-                self.notify("Source mode: git pull to update.")
+        if not is_frozen_build():
+            self._set_latest_release(None)
+            self.notify("Source mode: git pull to update.")
             return
         if not rel.exe_asset_url:
             self.notify(f"Latest release {rel.tag} has no Interceptify.exe asset.")
             return
-        self.notify(f"Downloading {rel.tag}...")
-        new_exe = ROOT / "Interceptify.exe.new"
+        self._update_in_progress = True
+        self.notify(f"Installing {rel.tag}...")
+        threading.Thread(target=self._perform_update, args=(rel,), daemon=True).start()
+
+    def _perform_update(self, rel: "self_updater.Release") -> None:
         try:
-            self_updater.download_asset(rel.exe_asset_url, new_exe)
-        except Exception as e:
-            self.notify(f"Download failed: {e}")
-            return
-        target_exe = Path(sys.executable).resolve()
-        bat = ROOT / "_interceptify_update.bat"
-        try:
-            self_updater.write_updater_bat(
-                bat, current_pid=os.getpid(),
-                new_exe=new_exe.resolve(), target_exe=target_exe,
-            )
-        except Exception as e:
-            self.notify(f"Updater script failed: {e}")
-            return
-        self.notify(f"Installing {rel.tag} - the app will restart in a few seconds.")
-        try:
+            self.notify(f"Downloading {rel.tag}...")
+            new_exe = ROOT / "Interceptify.exe.new"
+            try:
+                self_updater.download_asset(rel.exe_asset_url, new_exe)
+            except Exception as e:
+                self.notify(f"Download failed: {e}")
+                return
+            target_exe = Path(sys.executable).resolve()
+            bat = ROOT / "_interceptify_update.bat"
+            try:
+                self_updater.write_updater_bat(
+                    bat, current_pid=os.getpid(),
+                    new_exe=new_exe.resolve(), target_exe=target_exe,
+                )
+            except Exception as e:
+                self.notify(f"Updater script failed: {e}")
+                return
+            self.notify(f"Installing {rel.tag} - the app will restart in a few seconds.")
             subprocess.Popen(
                 ["cmd", "/c", str(bat)],
                 creationflags=0x00000008 | 0x00000200,
@@ -403,12 +398,13 @@ class InterceptifyApp:
         except Exception as e:
             self.notify(f"Updater launch failed: {e}")
             return
+        finally:
+            self._update_in_progress = False
         try:
             self.icon.stop()
         except Exception:
             pass
         os._exit(0)
-
     # ---- Personal: Spotify-update watcher (optional) -------------------
 
     def _on_spotify_update(self, event: dict) -> None:
